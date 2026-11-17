@@ -44,7 +44,7 @@ class InvestigationPrompt:
         return {"version": self.version, "sha256": self.sha256, "change_note": self.change_note}
 
 
-def load_investigation_prompt(version: str = "v1", prompts_dir: Path | None = None):
+def load_investigation_prompt(version: str = "v2", prompts_dir: Path | None = None):
     """读取指定版本，验证清单后返回不可变的文本快照。
 
     version 只允许 v1、v2 等明确编号，校验发生在构造资源路径之前。

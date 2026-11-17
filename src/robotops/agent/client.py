@@ -9,7 +9,17 @@ from ..models import Model
 class ModelError(RuntimeError):
     """模型调用、调用协议或最终报告校验失败，可向 API 返回经过整理的错误信息。"""
 
-    pass
+    def __init__(self, message: str, usage=None):
+        super().__init__(message)
+        # 仅保留计费计数，不把响应原文/供应商内部字段挂在可公开的异常上。
+        self.usage = {
+            key: value
+            for key, value in (usage if isinstance(usage, dict) else {}).items()
+            if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
 
 
 class FunctionCall(Model):
@@ -55,6 +65,7 @@ class DeepSeekClient:
         不把响应原文放进错误信息，避免供应商返回的敏感字段进入 API 和调查轨迹。
         此处只完成一次请求；后续是否继续调用由 LangGraph 调查节点决定。
         """
+        usage = {}
         try:
             with httpx.Client(
                 base_url=self.config.model_base_url.rstrip("/") + "/",
@@ -76,9 +87,10 @@ class DeepSeekClient:
             if response.is_error:
                 raise ModelError(f"Model endpoint returned HTTP {response.status_code}")
             payload = response.json()
+            usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
             message = payload["choices"][0]["message"]
             if not isinstance(message, dict) or message.get("role") != "assistant":
-                raise ModelError("Model returned an invalid assistant message")
+                raise ModelError("Model returned an invalid assistant message", usage)
             # 仅保留调查所需字段，供应商的内部推理字段和其他元数据不写入轨迹。
             message = {
                 key: message[key] for key in ("role", "content", "tool_calls") if key in message
@@ -89,4 +101,4 @@ class DeepSeekClient:
                 "model": payload.get("model", self.config.model),
             }
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
-            raise ModelError("Model request failed or returned an invalid response") from exc
+            raise ModelError("Model request failed or returned an invalid response", usage) from exc

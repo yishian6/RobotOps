@@ -25,8 +25,9 @@ import sys
 from pathlib import Path
 class BlockExamples(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname == "robotops_examples" or fullname.startswith("robotops_examples."):
-            raise AssertionError("Core imported the example package")
+        if any(fullname == name or fullname.startswith(name + ".")
+               for name in ("robotops_examples", "robotops_benchmarks")):
+            raise AssertionError("Core imported an example or benchmark package")
 sys.meta_path.insert(0, BlockExamples())
 from robotops.api import create_app
 from robotops.cli import main

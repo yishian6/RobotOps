@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robotops-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Evidence-driven application incident investigation, starting with a local runtime."
 requires-python = ">=3.11"
 dependencies = [
@@ -24,12 +24,12 @@ robotops = "robotops.cli:main"
 [tool.setuptools]
 # 源码、非敏感资源和可运行示例分别组织；显式映射确保 wheel 不依赖仓库路径。
 include-package-data = false
-packages = ["robotops", "robotops.agent", "robotops.resources", "robotops_examples", "robotops_examples.pipeline"]
-package-dir = {"robotops" = "src/robotops", "robotops.resources" = "config", "robotops_examples" = "examples"}
+packages = ["robotops", "robotops.agent", "robotops.resources", "robotops_examples", "robotops_examples.pipeline", "robotops_benchmarks"]
+package-dir = {"robotops" = "src/robotops", "robotops.resources" = "config", "robotops_examples" = "examples", "robotops_benchmarks" = "benchmarks"}
 
 [tool.setuptools.package-data]
 "robotops.resources" = ["robotops.toml", "prompts/investigation/*/*.txt", "prompts/investigation/*/manifest.json"]
-"robotops_examples.pipeline" = ["contract.json"]
+"robotops_examples.pipeline" = ["contract.json", "cases.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

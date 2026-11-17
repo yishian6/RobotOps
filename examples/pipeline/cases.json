@@ -1,0 +1,26 @@
+[
+  {
+    "app_id": "pipeline",
+    "app_version": "1",
+    "components": ["producer", "processor"],
+    "title": "输入断流：进程存活但没有持续输出",
+    "symptoms": "应用无输出 输入断流 输入速率为零",
+    "root_cause": "在 input_stopped 故障烟测中，producer 进程存活但停止发送样本。",
+    "resolution": "先检查当前进程实例和输入/输出采样，再区分停发与处理阻塞。该经验不是当前故障结论。",
+    "source_uri": "repo:tests/test_pipeline.py + examples/pipeline/smoke.py; fixture runbook, not production incident",
+    "verified_at": "2026-11-17T00:00:00Z",
+    "enabled": true
+  },
+  {
+    "app_id": "pipeline",
+    "app_version": "1",
+    "components": ["processor"],
+    "title": "配置不匹配：有输入而输出中断",
+    "symptoms": "应用无输出 配置错误 channel mismatch rejected",
+    "root_cause": "在 config_mismatch 故障烟测中，处理组件的期望 channel 与实际输入不同。",
+    "resolution": "结合本次拒绝计数、配置变更时间/版本及错误日志验证；不能仅凭无输出就重启。",
+    "source_uri": "repo:tests/test_pipeline.py + examples/pipeline/smoke.py; fixture runbook, not production incident",
+    "verified_at": "2026-11-17T00:00:00Z",
+    "enabled": true
+  }
+]

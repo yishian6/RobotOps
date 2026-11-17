@@ -23,10 +23,17 @@ class Config:
     api_key: str = field(default="", repr=False)
     model_timeout_seconds: float = 60
     prompts_dir: Path | None = None
-    prompt_version: str = "v1"
+    prompt_version: str = "v2"
+    context_strategy: str = "evidence"
 
     def __post_init__(self):
         """统一路径并拒绝不可用的模型配置，避免运行中才发现类型或地址错误。"""
+        if not isinstance(self.context_strategy, str) or self.context_strategy not in {
+            "full",
+            "rolling",
+            "evidence",
+        }:
+            raise ValueError("Context strategy must be full, rolling or evidence")
         if not isinstance(self.prompt_version, str) or not re.fullmatch(
             r"v[1-9][0-9]*", self.prompt_version
         ):
@@ -74,6 +81,7 @@ class Config:
                 "model_timeout_seconds",
                 "prompts_dir",
                 "prompt_version",
+                "context_strategy",
             }
             if set(values) - allowed:
                 raise ValueError(
@@ -93,6 +101,7 @@ class Config:
             "ROBOTOPS_MODEL_TIMEOUT_SECONDS": ("model_timeout_seconds", float),
             "ROBOTOPS_PROMPTS_DIR": ("prompts_dir", Path),
             "ROBOTOPS_PROMPT_VERSION": ("prompt_version", str),
+            "ROBOTOPS_CONTEXT_STRATEGY": ("context_strategy", str),
         }
         for variable, (name, convert) in overrides.items():
             if variable in os.environ:

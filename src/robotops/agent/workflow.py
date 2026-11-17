@@ -1,6 +1,7 @@
 """只读故障调查状态图；模型选择工具，后端校验报告及证据。"""
 
 import json
+import sys
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -11,11 +12,13 @@ from ..observations import ObservationSource
 from ..storage import Store
 from ..tools import ToolGateway, tool_definitions
 from .client import AssistantMessage, ModelError
+from .context import ContextSnapshots, Strategy, assemble
+from .memory import MemoryStore
 from .prompt_loader import InvestigationPrompt, investigation_messages
 
 
 class InvestigationState(TypedDict):
-    """单次图执行的工作状态；G0 每轮保留完整历史，尚不包含 G1 上下文压缩。
+    """单次图执行的规范历史；上下文装配只生成发送视图，不改写此历史。
 
     messages 按协议排列 system/user/assistant/tool 消息；节点返回替换后的完整列表。
     report 在调查期间为 None，只有最终报告通过校验后才填入结构化字典。
@@ -32,6 +35,7 @@ def investigate(
     complete,
     model_name: str,
     prompt: InvestigationPrompt | None = None,
+    context_strategy: Strategy = "evidence",
 ):
     """为已有事件创建一次只读调查，并返回最终的持久化运行记录。
 
@@ -50,16 +54,34 @@ def investigate(
     run_id = store.start_run(incident_id, model_name)
     gateway = ToolGateway(store, observer, run_id)
     tools = tool_definitions()
+    memory_store = MemoryStore(store, run_id)
+    snapshots = ContextSnapshots(store, run_id)
 
     def call_model(state):
         """追加一次模型响应；若没有工具调用，将内容作为最终诊断报告校验。"""
-        reply = complete(state["messages"], tools)
+        memory = memory_store.current()
+        outgoing, manifest = assemble(state["messages"], memory, context_strategy)
+        # 保存实际输入再请求；网络失败也有对应快照。规范历史始终另外保留。
+        snapshots.save(outgoing, tools, memory, manifest)
+        try:
+            reply = complete(outgoing, tools)
+        except ModelError as exc:
+            store.trace(run_id, {"type": "model_error", "usage": exc.usage, "error": str(exc)})
+            raise
+        # 无效响应也可能产生费用，但不能为记录用量而把未经筛选的响应正文写进轨迹。
+        event = {
+            "type": "model",
+            "usage": reply.get("usage", {}),
+            "model": reply.get("model", model_name),
+        }
         try:
             message = AssistantMessage.model_validate(reply["message"]).model_dump(
                 exclude_none=True
             )
         except ValidationError as exc:
+            store.trace(run_id, {**event, "message": None, "invalid_message": True})
             raise ModelError("Invalid model tool-call message") from exc
+        store.trace(run_id, {**event, "message": message})
         calls = message.get("tool_calls") or []
         if message.get("role") != "assistant" or not isinstance(calls, list):
             raise ModelError("Invalid model message")
@@ -68,15 +90,6 @@ def investigate(
         past_ids = {call["id"] for item in state["messages"] for call in item.get("tool_calls", [])}
         if len(set(ids)) != len(ids) or set(ids) & past_ids:
             raise ModelError("Duplicate tool call IDs")
-        store.trace(
-            run_id,
-            {
-                "type": "model",
-                "message": message,
-                "usage": reply.get("usage", {}),
-                "model": reply.get("model", model_name),
-            },
-        )
         report = None
         if not calls:
             try:
@@ -86,6 +99,17 @@ def investigate(
             # Prompt 只引导模型；运行归属与动作目标仍须由后端确定性校验。
             if not validated.referenced_evidence() <= store.evidence_ids(run_id):
                 raise ModelError("Model cited evidence outside this investigation")
+            # 历史经验只能帮助形成假设，不能单独证明当前实例故障。unavailable 也不是实测。
+            for hypothesis in validated.hypotheses:
+                if hypothesis.assessment == "unverified":
+                    continue
+                observations = [store.read_evidence(run_id, eid) for eid in hypothesis.evidence_ids]
+                if not any(
+                    item["tool"] not in {"retrieve_cases", "get_application_contract"}
+                    and item["raw"].get("status") == "ok"
+                    for item in observations
+                ):
+                    raise ModelError("A confirmed hypothesis requires current observation evidence")
             target = validated.recommended_action.target
             if target and target not in store.contract(incident["app_id"])["components"]:
                 raise ModelError("Model suggested a target outside the application contract")
@@ -145,7 +169,11 @@ def investigate(
         store.trace(
             run_id, {"type": "prompt", **prompt_metadata, "messages": messages, "tools": tools}
         )
-        result = graph.compile().invoke({"messages": messages, "report": None})
+        # LangGraph 默认 25 个节点步数会让正常长调查在约 12 轮后停止。
+        # 框架要求正整数，取平台最大值以移除此隐式配额；不拿减少调查步数作为降本手段。
+        result = graph.compile().invoke(
+            {"messages": messages, "report": None}, {"recursion_limit": sys.maxsize}
+        )
         store.finish_run(run_id, report=result["report"])
     except Exception as exc:
         # G0 不执行恢复；异常只标记调查失败并升级，不能把“流程结束”当作故障消失。

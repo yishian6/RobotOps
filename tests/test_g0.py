@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from robotops.agent.client import DeepSeekClient, ModelError
+from robotops.agent.prompt_loader import load_investigation_prompt
 from robotops.agent.workflow import investigate
 from robotops.api import create_app
 from robotops.config import Config
@@ -132,7 +133,15 @@ def test_langgraph_executes_real_tools_and_persists_trace(runtime):
             }
         }
 
-    run = investigate(store, demo, incident["id"], model_double, "test-double-not-a-real-model")
+    run = investigate(
+        store,
+        demo,
+        incident["id"],
+        model_double,
+        "test-double-not-a-real-model",
+        prompt=load_investigation_prompt("v1"),
+        context_strategy="full",
+    )
     assert run["state"] == "COMPLETED"
     assert store.incident(incident["id"])["state"] == "NEEDS_HUMAN"
     trace = store.trace(run["id"])

@@ -2,8 +2,10 @@
 
 from pydantic import AwareDatetime, Field, ValidationError
 
-from .models import Model, utc_now
+from .agent.memory import MemoryStore, WorkingMemory
+from .models import ApplicationContract, Identifier, Model, utc_now
 from .observations import ObservationSource, ObservationUnavailable
+from .retrieval import CaseLibrary
 from .storage import Store
 
 
@@ -33,6 +35,14 @@ class EvidenceArgs(Model):
     evidence_id: str = Field(pattern=r"^ev-[0-9a-f]{32}$")
 
 
+class CaseArgs(Model):
+    """检索条件只能收窄本次应用范围；版本由服务端契约确定。"""
+
+    query: str = Field(min_length=1, max_length=2000)
+    components: list[Identifier] = Field(default_factory=list)
+    limit: int = Field(default=5, ge=1, le=20)
+
+
 # 同一注册表同时生成模型工具定义并约束执行入口，避免“声明允许”和“实际可调”分离。
 TOOL_SPECS = {
     "get_application_contract": (NoArgs, "读取本次事件的应用契约、组件和健康标准。"),
@@ -44,6 +54,11 @@ TOOL_SPECS = {
     "search_logs": (LogArgs, "在受管组件日志中按关键词和起始时间查询，返回来源及截断说明。"),
     "get_recent_config_changes": (NoArgs, "读取受管应用的配置变更记录和当前配置版本。"),
     "read_evidence": (EvidenceArgs, "按证据 ID 回取本次调查已经保存的原始观测。"),
+    "retrieve_cases": (CaseArgs, "检索适用于当前应用版本/组件的已验证历史经验；不代表当前根因。"),
+    "update_working_memory": (
+        WorkingMemory,
+        "保存本次调查事实/假设/待查问题；支持和反对引用均保护原文。只修改调查记忆。",
+    ),
 }
 
 
@@ -92,10 +107,37 @@ class ToolGateway:
                 return {"status": "ok", **self.store.read_evidence(self.run_id, args.evidence_id)}
             except (KeyError, ValueError) as exc:
                 return {"status": "error", "error": str(exc)}
+        if name == "update_working_memory":
+            try:
+                return {"status": "ok", **MemoryStore(self.store, self.run_id).update(args)}
+            except ValueError as exc:
+                return {"status": "error", "error": str(exc)}
         observed_at = utc_now()
         try:
             if name == "get_application_contract":
                 data = self.store.contract(self.incident["app_id"])
+            elif name == "retrieve_cases":
+                try:
+                    contract = self.store.contract(self.incident["app_id"])
+                    focus = (
+                        ApplicationContract.model_validate(contract).dependency_scope(
+                            args.components
+                        )
+                        if args.components
+                        else []
+                    )
+                    data = {
+                        "kind": "historical_cases",
+                        "current_observation": False,
+                        "cases": CaseLibrary(self.store).search(
+                            contract,
+                            args.query,
+                            focus,
+                            args.limit,
+                        ),
+                    }
+                except ValueError as exc:
+                    return {"status": "error", "error": str(exc)}
             else:
                 if self.observer is None or self.incident["app_id"] != self.observer.app_id:
                     raise ObservationUnavailable("No observation adapter for this application")

@@ -1,15 +1,18 @@
 """核心 API：应用、事件、调查与证据；具体场景的控制路由由应用组装方挂载。"""
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .agent.client import DeepSeekClient, ModelError
+from .agent.context import ContextSnapshots
+from .agent.memory import MemoryStore
 from .agent.prompt_loader import load_investigation_prompt
 from .agent.workflow import investigate
 from .config import Config
 from .models import ApplicationContract, IncidentCreate
 from .observations import ObservationSource, ObservationUnavailable
+from .retrieval import CaseCreate, CaseLibrary
 from .storage import ConflictError, Store
 
 
@@ -52,11 +55,12 @@ def create_app(
         """返回服务配置摘要；不探测实际模型可用性，也不输出 API 密钥。"""
         return {
             "status": "ok",
-            "stage": "G0",
+            "stage": "G1",
             "version": __version__,
             "model": config.model,
             "model_configured": bool(config.api_key),
             "prompt": prompt.metadata,
+            "context_strategy": config.context_strategy,
         }
 
     @app.post("/applications", status_code=201)
@@ -67,6 +71,28 @@ def create_app(
     @app.get("/applications/{app_id}")
     def application(app_id: str):
         return store.contract(app_id)
+
+    @app.post("/cases", status_code=201)
+    def add_case(body: CaseCreate):
+        """本地管理入口；调用者应先完成外部验证，未填验证时间的草稿不会参与检索。"""
+        return CaseLibrary(store).add(body)
+
+    @app.get("/cases/{case_id}")
+    def case(case_id: str):
+        return CaseLibrary(store).get(case_id)
+
+    @app.delete("/cases/{case_id}")
+    def disable_case(case_id: str):
+        """撤回案例：保留可审查来源，后续检索不再返回，已有证据不改写。"""
+        return CaseLibrary(store).disable(case_id)
+
+    @app.get("/applications/{app_id}/cases")
+    def search_cases(
+        app_id: str,
+        query: str = Query(min_length=1, max_length=2000),
+        limit: int = Query(default=5, ge=1, le=20),
+    ):
+        return CaseLibrary(store).search(store.contract(app_id), query, limit=limit)
 
     @app.post("/incidents", status_code=201)
     def create_incident(body: IncidentCreate):
@@ -98,6 +124,7 @@ def create_app(
             callback,
             config.model,
             prompt,
+            config.context_strategy,
         )
 
     @app.get("/runs/{run_id}")
@@ -111,5 +138,44 @@ def create_app(
     @app.get("/runs/{run_id}/evidence/{evidence_id}")
     def evidence(run_id: str, evidence_id: str):
         return store.read_evidence(run_id, evidence_id)
+
+    @app.get("/runs/{run_id}/memory")
+    def memory(run_id: str):
+        return MemoryStore(store, run_id).current()
+
+    @app.get("/runs/{run_id}/contexts")
+    def contexts(run_id: str):
+        return ContextSnapshots(store, run_id).list()
+
+    @app.get("/runs/{run_id}/contexts/{sequence}")
+    def context(run_id: str, sequence: int):
+        return ContextSnapshots(store, run_id).get(sequence)
+
+    @app.get("/runs/{run_id}/usage")
+    def usage(run_id: str):
+        """累计实际返回的用量；缺失项计数单列，不把缺失当免费或推算货币费用。"""
+        events = [item for item in store.trace(run_id) if item["type"] in {"model", "model_error"}]
+        counts = {"prompt_tokens": 0, "completion_tokens": 0}
+        missing = {key: 0 for key in counts}
+        for event in events:
+            data = event.get("usage") or {}
+            for key in counts:
+                value = data.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    counts[key] += value
+                else:
+                    missing[key] += 1
+        requests = len(ContextSnapshots(store, run_id).list())
+        unreported = max(0, requests - len(events))
+        for key in missing:
+            missing[key] += unreported
+        return {
+            "recorded_attempts": len(events),
+            "reported_tokens": counts,
+            "missing_usage": missing,
+            "context_requests": requests,
+            "unreported_attempts": unreported,
+            "includes_summary_calls": False,
+        }
 
     return app

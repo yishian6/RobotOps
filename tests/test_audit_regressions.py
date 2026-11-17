@@ -59,7 +59,9 @@ def test_prompt_input_stays_pinned_until_application_restart(tmp_path):
         assert "changed-after-startup" not in messages[0]["content"]
         return {"message": {"role": "assistant", "content": json.dumps(manual_report())}}
 
-    app = create_app(Config(data_dir=tmp_path / "data", prompts_dir=root), complete=model)
+    app = create_app(
+        Config(data_dir=tmp_path / "data", prompts_dir=root, prompt_version="v1"), complete=model
+    )
     with TestClient(app) as client:
         pinned = client.get("/health").json()["prompt"]
         write_version(templates["system"] + "\nchanged-after-startup")

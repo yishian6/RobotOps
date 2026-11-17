@@ -1,3 +1,3 @@
-"""RobotOps Agent: local runtime and read-only investigation (G0)."""
+"""RobotOps Agent: evidence-aware application investigation (G1)."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

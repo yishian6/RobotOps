@@ -56,6 +56,20 @@ class Store:
                     observed_at TEXT NOT NULL, sha256 TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS evidence_run ON evidence(run_id);
+                CREATE TABLE IF NOT EXISTS cases (
+                    id TEXT PRIMARY KEY, app_id TEXT NOT NULL, app_version TEXT NOT NULL,
+                    body TEXT NOT NULL
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5(case_id UNINDEXED, terms);
+                CREATE TABLE IF NOT EXISTS memories (
+                    run_id TEXT NOT NULL REFERENCES runs, version INTEGER NOT NULL,
+                    body TEXT NOT NULL, PRIMARY KEY(run_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS context_snapshots (
+                    run_id TEXT NOT NULL REFERENCES runs, sequence INTEGER NOT NULL,
+                    body TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    PRIMARY KEY(run_id, sequence)
+                );
             """)
 
     @contextmanager

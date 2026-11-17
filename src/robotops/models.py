@@ -35,13 +35,46 @@ class ApplicationContract(Model):
     version: str = Field(default="1", min_length=1, max_length=64)
     description: str = Field(default="", max_length=1000)
     components: list[Identifier]
+    dependencies: dict[Identifier, list[Identifier]] = Field(default_factory=dict)
     health: HealthContract = Field(default_factory=HealthContract)
 
     @model_validator(mode="after")
     def unique_components(self):
         if not self.components or len(set(self.components)) != len(self.components):
             raise ValueError("Components must be nonempty and unique")
+        known = set(self.components)
+        if not set(self.dependencies) <= known or any(
+            not set(values) <= known or len(set(values)) != len(values)
+            for values in self.dependencies.values()
+        ):
+            raise ValueError("Dependencies must reference unique declared components")
+
+        # 契约明确使用有向无环依赖；环会让故障上游范围失去清晰语义，注册时直接拒绝。
+        checked = set()
+
+        def visit(node, path):
+            if node in path:
+                raise ValueError("Application dependencies contain a cycle")
+            if node in checked:
+                return
+            for upstream in self.dependencies.get(node, []):
+                visit(upstream, path | {node})
+            checked.add(node)
+
+        for component in self.components:
+            visit(component, set())
         return self
+
+    def dependency_scope(self, focus: list[str]) -> list[str]:
+        """返回焦点及其传递上游；未声明焦点时保留全应用范围，不猜测组件关系。"""
+        relevant = set(focus or self.components)
+        pending = list(relevant)
+        while pending:
+            for upstream in self.dependencies.get(pending.pop(), []):
+                if upstream not in relevant:
+                    relevant.add(upstream)
+                    pending.append(upstream)
+        return sorted(relevant)
 
 
 class IncidentCreate(Model):
