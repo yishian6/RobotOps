@@ -143,14 +143,16 @@ README 独立提供安装、运行、配置和边界说明。
 
 案例的 `verified_at` 是调用者完成外部验证后的声明，不是平台自动认证；不把模型报告自动入库为已验证案例。FTS5 使用英文单词和中文双字词，属于轻量词法检索，不具备向量语义检索能力。参考 [SQLite FTS5](https://www.sqlite.org/fts5.html) 和 [JSON 函数](https://www.sqlite.org/json1.html)。
 
-可显式导入示例检查手册（服务须已启动）：
+先启动 pipeline 示例服务（`python -m robotops_examples.pipeline serve`），再显式导入检查手册：
 
 ```bash
+curl -sS -X POST http://127.0.0.1:8000/demo/start
 .venv/bin/python -m robotops_examples.pipeline.cases | while IFS= read -r case_payload; do
   curl -sS -X POST http://127.0.0.1:8000/cases \
     -H 'Content-Type: application/json' --data-binary "$case_payload"
 done
-curl -sS 'http://127.0.0.1:8000/applications/pipeline/cases?query=input'
+curl -sS -G http://127.0.0.1:8000/applications/pipeline/cases \
+  --data-urlencode 'query=输入断流'
 ```
 
 手册注明真实 smoke fixture 的来源，不冒充生产事故记录；不会自动注入当前故障真值。重复导入会创建新记录；可用 `DELETE /cases/{id}` 撤回，已保存的调查证据不会改写。应用尚未注册时，先调用示例的 `/demo/start`。
