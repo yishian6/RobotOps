@@ -1,0 +1,20 @@
+.venv/
+.tools/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+data/
+# 所有环境文件仅保留在本地，包括示例文件。
+.env*
+
+# 本地设计、分析与开发记录不随源码提交，仅保留根目录 README。
+/doc/
+*.md
+!/README.md
+.vscode

@@ -1,0 +1,6 @@
+{
+  "name": "investigation",
+  "version": "v1",
+  "sha256": "e876dbe04cd44f3a88749a08323fc7484c2803dabccac9970f91f7e7e7981057",
+  "change_note": "G0 只读故障调查基线：按契约取证、引用本次证据、证据不足升级。"
+}

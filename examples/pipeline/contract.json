@@ -1,0 +1,10 @@
+{
+  "app_id": "pipeline",
+  "version": "1",
+  "description": "本地输入生产与数据处理应用，用于验证机器人应用运维 Agent 核心",
+  "components": ["producer", "processor"],
+  "health": {
+    "min_input_hz": 5,
+    "max_output_silence_seconds": 1
+  }
+}

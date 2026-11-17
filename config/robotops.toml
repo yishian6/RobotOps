@@ -1,0 +1,9 @@
+# 非敏感运行配置；密钥只从 DEEPSEEK_API_KEY 环境变量读取。
+# 文件中的相对路径以本配置所在目录为基准。
+data_dir = "../data"
+model = "deepseek-flash"
+model_base_url = "https://api.deepseek.com"
+model_timeout_seconds = 60
+prompts_dir = "prompts"
+# 明确固定 Prompt 版本；切换到已验证版本后重启服务，回退同样修改此值。
+prompt_version = "v1"
