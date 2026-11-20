@@ -1,4 +1,6 @@
-"""本地 pipeline 示例的故障注入与真实工具烟测。"""
+"""
+    本地 pipeline 示例的故障注入与真实工具烟测。
+"""
 
 import tempfile
 import time
@@ -13,11 +15,18 @@ from .runtime import PipelineRuntime
 
 
 def smoke_check():
-    """在临时目录启动真实组件，验证故障会引起预期的进程、指标和日志变化。
+    """
+        在临时目录启动真实组件，验证故障会引起预期的进程、指标和日志变化。
 
-    依次覆盖正常、输入断流、处理停滞、配置错误和处理进程退出；每次观测经真实工具
-    取得并保存证据。finally 始终清理组件，临时目录随上下文退出删除。
-    返回包含各场景观测的汇总；此流程不调用模型，不能据此宣称模型诊断正确。
+        依次覆盖正常、输入断流、处理停滞、配置错误和处理进程退出；每次观测经真实工具
+        取得并保存证据。finally 始终清理组件，临时目录随上下文退出删除。
+        返回包含各场景观测的汇总；此流程不调用模型，不能据此宣称模型诊断正确。
+
+        Args:
+            无显式参数。
+
+        Returns:
+            dict: 含 passed 状态、model_called=False 和各故障观测的汇总。
     """
     with tempfile.TemporaryDirectory(prefix="robotops-smoke-") as temporary:
         root = Path(temporary)
@@ -44,6 +53,7 @@ def smoke_check():
                 if metrics["status"] != "ok":
                     raise RuntimeError("Demo metrics unavailable")
                 rates = metrics["data"]["rates"]
+                # 场景名只选择验收条件，现象值必须来自真实计数，不能用注入真值代替观测结果。
                 checks = {
                     "normal": rates["processor"]["processed_hz"] > 0,
                     "input_stopped": rates["producer"]["sent_hz"] == 0,
@@ -54,6 +64,7 @@ def smoke_check():
                 if not checks[mode]:
                     raise RuntimeError(f"Unexpected actual telemetry for {mode}: {rates}")
                 results[mode] = {"rates": rates, "evidence_id": metrics["evidence_id"]}
+            # 速率之外再检查实际错误日志与进程退出，覆盖不同观测来源，避免仅验证控制文件写入。
             logs = gateway.execute("search_logs", {"keyword": "input_channel_mismatch"})
             if not logs.get("data", {}).get("rows"):
                 raise RuntimeError("Configuration mismatch did not produce a real error log")

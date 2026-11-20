@@ -1,4 +1,6 @@
-"""职责边界回归检查：核心可独立启动，示例控制和模板资源分别管理。"""
+"""
+    职责边界回归检查：核心可独立启动，示例控制和模板资源分别管理。
+"""
 
 import subprocess
 import sys
@@ -12,6 +14,15 @@ from robotops.config import Config
 
 
 def test_core_has_no_demo_control_routes(tmp_path):
+    """
+        验证核心服务独立启动且不会暴露示例故障控制路由。
+
+        Args:
+            tmp_path: pytest 提供的独立临时目录，隔离本用例的数据库、证据和文件资源。
+
+        Returns:
+            None: 全部断言与预期异常检查通过时正常结束。
+    """
     with TestClient(create_app(Config(data_dir=tmp_path))) as client:
         assert client.get("/health").status_code == 200
         assert client.post("/demo/start").status_code == 404
@@ -20,6 +31,16 @@ def test_core_has_no_demo_control_routes(tmp_path):
 
 def test_core_imports_without_example_package(tmp_path):
     # 阻止示例包导入，比只搜索 import 字符串更能发现间接/动态反向依赖。
+    """
+        在子进程中阻断示例/实验包导入，验证核心工厂与所有有效 CLI 分支的单向依赖。
+
+        Args:
+            tmp_path: pytest 提供的独立临时目录，隔离本用例的数据库、证据和文件资源。
+
+        Returns:
+            None: 全部断言与预期异常检查通过时正常结束。
+    """
+    # 在独立解释器中拦截示例包导入，并实际执行 CLI 分支，避免当前测试进程的导入缓存掩盖耦合。
     code = """import importlib.abc
 import sys
 from pathlib import Path
@@ -56,5 +77,14 @@ for removed in (["smoke"], ["serve", "--example", "pipeline"]):
 
 
 def test_explicit_prompt_directory_does_not_fall_back(tmp_path):
+    """
+        验证显式模板目录错误时直接失败，不悄悄退回包内资源。
+
+        Args:
+            tmp_path: pytest 提供的独立临时目录，隔离本用例的数据库、证据和文件资源。
+
+        Returns:
+            None: 全部断言与预期异常检查通过时正常结束。
+    """
     with pytest.raises(ValueError, match="unknown investigation prompt"):
         load_investigation_prompt("v1", tmp_path / "missing-prompts")

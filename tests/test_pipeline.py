@@ -1,4 +1,6 @@
-"""独立 pipeline 示例的真实进程、观测与生命周期集成检查。"""
+"""
+    独立 pipeline 示例的真实进程、观测与生命周期集成检查。
+"""
 
 import json
 import subprocess
@@ -13,6 +15,15 @@ from robotops.config import Config
 
 def test_real_demo_faults_and_tools():
     # 从示例自己的入口运行，验证命令分派及实际故障；不借助核心 CLI。
+    """
+        从示例自己的 CLI 运行真实故障烟测，验证全部场景且没有调用模型。
+
+        Args:
+            无显式参数。
+
+        Returns:
+            None: 全部断言与预期异常检查通过时正常结束。
+    """
     completed = subprocess.run(
         [sys.executable, "-m", "robotops_examples.pipeline", "smoke"],
         check=True,
@@ -33,6 +44,15 @@ def test_real_demo_faults_and_tools():
 
 
 def test_demo_api_shuts_down_owned_children(tmp_path):
+    """
+        验证重复启动、非法故障参数和组件退出，并确认服务关闭后回收其子进程。
+
+        Args:
+            tmp_path: pytest 提供的独立临时目录，隔离本用例的数据库、证据和文件资源。
+
+        Returns:
+            None: 全部断言与预期异常检查通过时正常结束。
+    """
     app = create_app(Config(data_dir=tmp_path))
     with TestClient(app) as client:
         started = client.post("/demo/start")
@@ -46,6 +66,15 @@ def test_demo_api_shuts_down_owned_children(tmp_path):
 
 
 def test_demo_registers_configured_contract(tmp_path):
+    """
+        验证示例使用显式契约文件注册应用，配置描述确实进入数据库。
+
+        Args:
+            tmp_path: pytest 提供的独立临时目录，隔离本用例的数据库、证据和文件资源。
+
+        Returns:
+            None: 全部断言与预期异常检查通过时正常结束。
+    """
     path = tmp_path / "pipeline.json"
     path.write_text(
         json.dumps(

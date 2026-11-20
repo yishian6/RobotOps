@@ -1,4 +1,6 @@
-"""pipeline 示例的独立入口：python -m robotops_examples.pipeline。"""
+"""
+    pipeline 示例的独立入口：python -m robotops_examples.pipeline。
+"""
 
 import argparse
 import json
@@ -7,10 +9,17 @@ from .smoke import smoke_check
 
 
 def main():
-    """分派本示例的服务与烟测，不向核心 CLI 注册场景命令。
+    """
+        分派本示例的服务与烟测，不向核心 CLI 注册场景命令。
 
-    serve 组装带 /demo 控制路由的示例应用；smoke 在临时目录运行真实故障检查，
-    返回观测汇总并清理子进程。两者都通过明确的示例入口调用。
+        serve 组装带 /demo 控制路由的示例应用；smoke 在临时目录运行真实故障检查，
+        返回观测汇总并清理子进程。两者都通过明确的示例入口调用。
+
+        Args:
+            无显式参数。
+
+        Returns:
+            None: 启动示例 API，或输出真实故障烟测的 JSON 汇总。
     """
     parser = argparse.ArgumentParser(description="RobotOps pipeline example")
     commands = parser.add_subparsers(dest="command", required=True)

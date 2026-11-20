@@ -1,4 +1,6 @@
-"""核心命令行入口，仅负责核心服务与 Prompt 配置检查。"""
+"""
+    核心命令行入口，仅负责核心服务与 Prompt 配置检查。
+"""
 
 import argparse
 import json
@@ -8,10 +10,17 @@ from .config import Config
 
 
 def main():
-    """启动核心服务，或离线检查所选 Prompt。
+    """
+        启动核心服务，或离线检查所选 Prompt。
 
-    所有分支只依赖核心模块。可运行示例有自己的模块入口，核心不负责选择示例工厂、
-    导入示例代码或分派其烟测命令，保持“示例依赖核心”的单向关系。
+        所有分支只依赖核心模块。可运行示例有自己的模块入口，核心不负责选择示例工厂、
+        导入示例代码或分派其烟测命令，保持“示例依赖核心”的单向关系。
+
+        Args:
+            无显式参数。
+
+        Returns:
+            None: 启动本地服务，或把已验证 Prompt 元数据写入标准输出。
     """
     parser = argparse.ArgumentParser(description="RobotOps local runtime and investigation")
     commands = parser.add_subparsers(dest="command", required=True)
