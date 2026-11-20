@@ -1,4 +1,6 @@
-"""管理一个本地真实进程会话：启动、观测、故障注入及退出清理。"""
+"""
+    管理一个本地真实进程会话：启动、观测、故障注入及退出清理。
+"""
 
 import json
 import os
@@ -18,15 +20,24 @@ from .worker import read_json, write_json
 
 
 def process_info(pid: int):
-    """读取受管 PID 的 /proc 信息，返回存活状态、启动标识、内存和累计 CPU 时间。
+    """
+        读取受管 PID 的 /proc 信息，返回存活状态、启动标识、内存和累计 CPU 时间。
 
-    调用者仅传入本会话拥有的 PID。start_ticks 用来识别同一 PID 被其他进程复用；
-    Z/X 状态视为已退出，CPU 时间是累计秒数而不是 CPU 使用率百分比。
-    进程在读取前消失时返回 alive=False，其余文件访问错误交给上层处理。
+        调用者仅传入本会话拥有的 PID。start_ticks 用来识别同一 PID 被其他进程复用；
+        Z/X 状态视为已退出，CPU 时间是累计秒数而不是 CPU 使用率百分比。
+        进程在读取前消失时返回 alive=False，其余文件访问错误交给上层处理。
+
+        Args:
+            pid (int): 本管理器持有的 Linux 子进程 PID；不能用任意外部 PID 作为处置目标。
+
+        Returns:
+            dict: 存活时返回启动标识、RSS 字节数与累计 CPU 秒数；进程消失时含 alive=False。
     """
     try:
         # comm 字段在括号中，可能包含空格；先从最后一个右括号切分再按固定字段取值。
         stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        # 切掉 pid/comm 后下标 0 对应内核字段 3：19 是启动 ticks，21 是 RSS 页数。
+        # RSS 乘页大小变字节，用户态/内核态 CPU ticks 除时钟频率变累计秒数，而非使用率。
         rss = int(stat[21]) * os.sysconf("SC_PAGE_SIZE")
         return {
             "pid": pid,
@@ -41,25 +52,43 @@ def process_info(pid: int):
 
 
 class PipelineRuntime:
-    """单个会话的进程所有者，所有公开操作通过同一把可重入锁协调。
+    """
+        单个会话的进程所有者，所有公开操作通过同一把可重入锁协调。
 
-    每次 start 创建独立目录和实例 ID，避免旧遥测混入新会话。
-    使用 RLock 是因为 start 的失败清理、状态返回还会调用本对象的 stop/snapshot。
-    这里只跟踪当前 Python 进程创建的子进程，不接管重启前遗留的运行实例。
+        每次 start 创建独立目录和实例 ID，避免旧遥测混入新会话。
+        使用 RLock 是因为 start 的失败清理、状态返回还会调用本对象的 stop/snapshot。
+        这里只跟踪当前 Python 进程创建的子进程，不接管重启前遗留的运行实例。
     """
 
     def __init__(self, root: Path):
+        """
+            初始化只管理当前 Python 进程所创建子进程的运行时。
+
+            Args:
+                root (Path): 平台数据根目录；示例会话目录位于其 demo/ 子目录下。
+
+            Returns:
+                None: 建立会话路径和进程账本，不创建目录或启动子进程。
+        """
         self.root = root / "demo"
         self.runtime: Path | None = None
+        # 只记录本对象创建的子进程；expected_starts 另存内核启动标识，用来排除 PID 复用。
         self.processes: dict[str, subprocess.Popen] = {}
         self.expected_starts = {}
         self._lock = threading.RLock()
 
     def start(self):
-        """启动处理端、取得实际绑定端口，再启动生产端，最后返回运行快照。
+        """
+            启动处理端、取得实际绑定端口，再启动生产端，最后返回运行快照。
 
-        只允许一个活跃会话；任一组件启动失败都先清理已创建子进程再向上传递异常。
-        处理端端口由操作系统分配，避免先选端口再绑定导致的占用竞态。
+            只允许一个活跃会话；任一组件启动失败都先清理已创建子进程再向上传递异常。
+            处理端端口由操作系统分配，避免先选端口再绑定导致的占用竞态。
+
+            Args:
+                无显式参数。
+
+            Returns:
+                dict: 两个组件就绪后的会话 ID、进程信息与遥测快照。
         """
         with self._lock:
             if self.runtime is not None:
@@ -70,6 +99,7 @@ class PipelineRuntime:
                 self.runtime.mkdir(parents=True)
                 write_json(self.runtime / "private-controls.json", {})
                 self._set_config("scan")
+                # 处理端真正绑定成功后才启动生产端，避免首批样本发往尚未就绪的端口。
                 self._spawn("processor")
                 port = read_json(self.runtime / "processor.json")["bound_port"]
                 self._spawn("producer", port)
@@ -79,10 +109,18 @@ class PipelineRuntime:
             return self.snapshot()
 
     def _spawn(self, component: str, port: int = 0):
-        """用当前解释器启动固定 worker 模块，等待匹配 instance_id 的首份遥测。
+        """
+            用当前解释器启动固定 worker 模块，等待匹配 instance_id 的首份遥测。
 
-        component/port 来自本管理器，不直接接受 Agent 参数；不经 shell 拼接执行。
-        stderr 独立落盘便于调查启动失败，超时和提前退出均抛 ObservationUnavailable。
+            component/port 来自本管理器，不直接接受 Agent 参数；不经 shell 拼接执行。
+            stderr 独立落盘便于调查启动失败，超时和提前退出均抛 ObservationUnavailable。
+
+            Args:
+                component (str): 管理器内部确定的 producer/processor 名称；不接受任意可执行程序。
+                port (int): producer 的目标 UDP 端口；processor 使用默认 0 并自行绑定系统分配端口。
+
+            Returns:
+                None: 子进程已登记且首份遥测的实例 ID 与本次启动一致。
         """
         instance = uuid4().hex
         errors = self.runtime / f"{component}.stderr.log"
@@ -104,21 +142,33 @@ class PipelineRuntime:
                 stdout=subprocess.DEVNULL,
                 stderr=error_output,
             )
+        # 先登记所有权再等待就绪，后续任何启动错误都能经 stop 找到并回收这个子进程。
         self.processes[component] = process
         self.expected_starts[component] = process_info(process.pid).get("start_ticks")
+        # 组件就绪期限使用单调时钟，避免系统校时导致启动等待提前结束或无限延长。
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise ObservationUnavailable(f"{component} exited during startup; inspect {errors}")
             sample = read_json(self.runtime / f"{component}.json")
+            # 仅文件存在不代表本次进程就绪，必须匹配本次启动的实例，避免误读旧文件。
             if sample.get("instance_id") == instance:
                 return
             time.sleep(0.02)
         raise ObservationUnavailable(f"{component} startup timed out")
 
     def _set_config(self, expected_channel: str):
-        """只在期望输入通道变化时递增配置版本，并记录变更前后值供诊断检索。"""
+        """
+            只在期望输入通道变化时递增配置版本，并记录变更前后值供诊断检索。
+
+            Args:
+                expected_channel (str): 处理组件应接受的输入通道名，调用时须已有活跃会话。
+
+            Returns:
+                None: 目标值未变化时无副作用，否则更新配置并追加版本化变更记录。
+        """
         old = read_json(self.runtime / "config.json")
+        # 相同值不制造新配置版本，避免重复控制请求产生看似相关、实际无变化的诊断噪声。
         if old.get("expected_channel") == expected_channel:
             return
         current = {"version": old.get("version", 0) + 1, "expected_channel": expected_channel}
@@ -127,11 +177,18 @@ class PipelineRuntime:
             output.write(json.dumps({"at": utc_now(), "before": old, "after": current}) + "\n")
 
     def inject(self, mode: str):
-        """将开发者选择的场景施加到真实 worker，返回场景名和所属会话。
+        """
+            将开发者选择的场景施加到真实 worker，返回场景名和所属会话。
 
-        停发/停滞通过私有控制文件实现；配置错误修改实际期望通道；退出终止处理端。
-        normal 解除控制并恢复正确配置，但不会重新启动已退出的子进程。
-        场景真值和私有控制文件不通过 Agent 工具暴露，Agent 只能查询实际运行现象。
+            停发/停滞通过私有控制文件实现；配置错误修改实际期望通道；退出终止处理端。
+            normal 解除控制并恢复正确配置，但不会重新启动已退出的子进程。
+            场景真值和私有控制文件不通过 Agent 工具暴露，Agent 只能查询实际运行现象。
+
+            Args:
+                mode (str): normal/input_stopped/processing_stalled/config_mismatch/processor_exit 之一。
+
+            Returns:
+                dict: 已施加的模式名与当前 runtime_id；不表示故障已由 Agent 诊断。
         """
         with self._lock:
             if self.runtime is None:
@@ -144,6 +201,7 @@ class PipelineRuntime:
                 "processor_exit",
             }:
                 raise ValueError("Unsupported demo fault")
+            # 每次覆盖完整控制状态，切换场景时不会残留上一场景的暂停/停滞开关。
             write_json(
                 self.runtime / "private-controls.json",
                 {
@@ -157,10 +215,17 @@ class PipelineRuntime:
             return {"applied": mode, "runtime_id": self.runtime.name}
 
     def snapshot(self):
-        """组合操作系统进程事实与 worker 遥测，不把旧遥测当作当前存活证明。
+        """
+            组合操作系统进程事实与 worker 遥测，不把旧遥测当作当前存活证明。
 
-        先回收退出子进程，再比较启动标识识别 PID 复用；遥测可能保留退出前的内容，
-        使用方应结合 process.alive、实例和观测时间解释，不能只看最后一份计数。
+            先回收退出子进程，再比较启动标识识别 PID 复用；遥测可能保留退出前的内容，
+            使用方应结合 process.alive、实例和观测时间解释，不能只看最后一份计数。
+
+            Args:
+                无显式参数。
+
+            Returns:
+                dict: 当前会话、观测时间及各组件的进程事实与遥测。
         """
         with self._lock:
             if self.runtime is None:
@@ -171,6 +236,7 @@ class PipelineRuntime:
                 observed = process_info(process.pid)
                 if observed.get("start_ticks") != self.expected_starts.get(component):
                     observed["alive"] = False
+                # 遥测保留退出前的计数供调查，真实存活状态单独来自 /proc，不能互相替代。
                 try:
                     telemetry = read_json(self.runtime / f"{component}.json")
                 except json.JSONDecodeError as exc:
@@ -189,12 +255,19 @@ class PipelineRuntime:
             }
 
     def public_file(self, name: str):
-        """返回白名单 JSONL 的有效记录、会话归属及读取完整性说明。
+        """
+            返回白名单 JSONL 的有效记录、会话归属及读取完整性说明。
 
-        最多读取文件末尾 1 MiB；截断时丢弃可能不完整的首行，避免解析半条 JSON。
-        追加中的末行暂不解析并标记 incomplete_tail；完整但损坏的行计入 malformed_lines。
-        有效行必须是带时区 at 时间的对象，避免单条坏记录导致全部日志不可检索。
-        文件尚未产生时返回空记录；空日志或部分读取均不能证明应用健康。
+            最多读取文件末尾 1 MiB；截断时丢弃可能不完整的首行，避免解析半条 JSON。
+            追加中的末行暂不解析并标记 incomplete_tail；完整但损坏的行计入 malformed_lines。
+            有效行必须是带时区 at 时间的对象，避免单条坏记录导致全部日志不可检索。
+            文件尚未产生时返回空记录；空日志或部分读取均不能证明应用健康。
+
+            Args:
+                name (str): producer.jsonl、processor.jsonl 或 config_changes.jsonl，不能传入目录路径。
+
+            Returns:
+                dict: 当前会话的有效 rows、truncated、malformed_lines 和 incomplete_tail。
         """
         with self._lock:
             if self.runtime is None:
@@ -202,6 +275,7 @@ class PipelineRuntime:
             if name not in {"producer.jsonl", "processor.jsonl", "config_changes.jsonl"}:
                 raise ValueError("File is not a diagnostic source")
             path = self.runtime / name
+            # 完整性标记分别表达读取范围、坏行与追加中的末行；空 rows 不能概括这些差异。
             result = {
                 "runtime_id": self.runtime.name,
                 "rows": [],
@@ -217,13 +291,16 @@ class PipelineRuntime:
                 size = source.tell()
                 result["truncated"] = size > 1024 * 1024
                 source.seek(max(0, size - 1024 * 1024))
+                # 截断起点可能落在行中，保守丢弃边界第一行并保留 truncated，不能把半条事件算作完整证据。
                 if result["truncated"]:
                     source.readline()
                 body = source.read()
             lines = body.splitlines()
+            # 追加中的最后一行尚未提交，单独标记后暂不解析，避免把正常并发写入误报为坏日志。
             if body and not body.endswith(b"\n"):
                 result["incomplete_tail"] = True
                 lines.pop()
+            # 单条损坏记录只计数并跳过；其余有效行仍可检索，同时向调用者保留数据缺口。
             for line in lines:
                 if not line.strip():
                     continue
@@ -241,17 +318,34 @@ class PipelineRuntime:
 
     @staticmethod
     def _terminate(process):
-        """先请求退出并等待，超时后强制终止再回收；仅作用于已持有的子进程对象。"""
+        """
+            先请求退出并等待，超时后强制终止再回收；仅作用于已持有的子进程对象。
+
+            Args:
+                process: 本会话持有的 Popen 子进程对象，不按名称查找其他进程。
+
+            Returns:
+                None: 进程已退出或已等待回收；已退出时不重复发送信号。
+        """
         if process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
+                # 强制终止后仍要 wait 回收；kill 只发信号，单独使用会遗留僵尸进程。
                 process.kill()
                 process.wait(timeout=2)
 
     def stop(self):
-        """仅清理本会话拥有的 Popen 子进程，不按进程名搜索和终止其他应用。"""
+        """
+            仅清理本会话拥有的 Popen 子进程，不按进程名搜索和终止其他应用。
+
+            Args:
+                无显式参数。
+
+            Returns:
+                None: 正常完成时清空子进程、启动标识账本及活跃会话引用。
+        """
         with self._lock:
             for process in self.processes.values():
                 self._terminate(process)

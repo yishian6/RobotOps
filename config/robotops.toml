@@ -4,6 +4,8 @@ data_dir = "../data"
 model = "deepseek-flash"
 model_base_url = "https://api.deepseek.com"
 model_timeout_seconds = 60
+# 默认直连；仅在确实需要继承系统代理/证书环境时改为 true。
+model_trust_env = false
 prompts_dir = "prompts"
 # 明确固定 Prompt 版本；切换到已验证版本后重启服务，回退同样修改此值。
 prompt_version = "v2"

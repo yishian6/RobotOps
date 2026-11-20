@@ -9,14 +9,19 @@ description = "Evidence-driven application incident investigation, starting with
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",
-    "httpx>=0.27,<1",
+    "langchain-deepseek>=1,<2",
     "langgraph>=1,<2",
+    "openai>=2.45,<3",
     "pydantic>=2.9,<3",
     "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+dev = [
+    "httpx>=0.27,<1",
+    "pytest>=8,<10",
+    "ruff>=0.9,<1",
+]
 
 [project.scripts]
 robotops = "robotops.cli:main"
@@ -28,7 +33,13 @@ packages = ["robotops", "robotops.agent", "robotops.resources", "robotops_exampl
 package-dir = {"robotops" = "src/robotops", "robotops.resources" = "config", "robotops_examples" = "examples", "robotops_benchmarks" = "benchmarks"}
 
 [tool.setuptools.package-data]
-"robotops.resources" = ["robotops.toml", "prompts/investigation/*/*.txt", "prompts/investigation/*/manifest.json"]
+"robotops.resources" = [
+    "robotops.toml",
+    "prompts/investigation/*/*.txt",
+    "prompts/investigation/*/manifest.json",
+    "prompts/supervision/v1/roles.json",
+    "prompts/adaptive/*/roles.json",
+]
 "robotops_examples.pipeline" = ["contract.json", "cases.json"]
 
 [tool.pytest.ini_options]
