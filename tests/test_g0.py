@@ -12,7 +12,9 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from robotops.agent.client import DeepSeekClient, ModelError
+from robotops.agent.context import ContextSnapshots
 from robotops.agent.prompt_loader import load_investigation_prompt
+from robotops.agent.recovery import InvestigationRecovery
 from robotops.agent.workflow import investigate
 from robotops.api import create_app
 from robotops.config import Config
@@ -138,9 +140,45 @@ def test_manual_investigation_stops_after_three_empty_log_checks(runtime):
     run = investigate(store, Observer(), incident["id"], complete, "test-model")
     assert len(offered) == 4 and offered[-1] == {"submit_report"}
     assert run["state"] == "COMPLETED" and run["report"]["status"] == "needs_human"
-    from robotops.agent.context import ContextSnapshots
+    manifest = ContextSnapshots(store, run["id"]).get(4)["manifest"]
+    assert manifest["report_only"] == "no_progress" and manifest["stalled_tool_batches"] == 3
+    assert manifest["model_budget"] == {
+        "limit": 8, "claimed": 4, "remaining": 4, "reserved_for_parent_report": 0,
+    }
 
-    assert ContextSnapshots(store, run["id"]).get(4)["manifest"]["report_only"] == "no_progress"
+
+def test_progress_uses_observation_content_across_reads_and_dispatches():
+    first_log = {"at": "t1", "message": "started"}
+    second_log = {"at": "t2", "message": "waiting"}
+    log = {"runtime_id": "r1", "rows": [first_log, second_log]}
+    evidence = {
+        identifier: {
+            "id": identifier, "tool": "search_logs", "raw": {"status": "ok", "data": log},
+        } for identifier in ("ev-1", "ev-2")
+    }
+    recovery = InvestigationRecovery(evidence.__getitem__)
+
+    assert recovery.record_progress("search_logs", {"status": "ok", "data": log})
+    assert not recovery.record_progress("search_logs", {
+        "status": "ok", "data": {**log, "rows": [second_log]},
+    })
+    assert not recovery.record_progress("read_evidence", {"status": "ok", **evidence["ev-1"]})
+    assert not recovery.record_progress("dispatch_investigation", {
+        "status": "ok", "findings": [{"support_ids": ["ev-2"]}],
+    })
+    assert recovery.record_progress("search_logs", {
+        "status": "ok", "data": {**log, "rows": [{**second_log, "at": "t3"}]},
+    })
+
+    def metrics(time, age):
+        return {"status": "ok", "data": {
+            "window_end": time, "current": {"observed_at": time, "heartbeat_at": time},
+            "processed_count": 25, "in_flight_processing_age_ms": age,
+        }}
+
+    assert recovery.record_progress("query_metrics", metrics("t1", 5000))
+    assert not recovery.record_progress("query_metrics", metrics("t2", 5000))
+    assert recovery.record_progress("query_metrics", metrics("t3", 8000))
 
 
 def test_contract_boundary():
@@ -295,8 +333,9 @@ def test_langgraph_executes_real_tools_and_persists_trace(runtime):
     assert run["state"] == "COMPLETED"
     assert store.incident(incident["id"])["state"] == "NEEDS_HUMAN"
     trace = store.trace(run["id"])
-    assert [item["type"] for item in trace] == ["prompt", "model", "tool", "model", "tool", "model"]
-    snapshot = trace[0]
+    protocol = [item for item in trace if item["type"] != "model_budget"]
+    assert [item["type"] for item in protocol] == ["prompt", "model", "tool", "model", "tool", "model"]
+    snapshot = protocol[0]
     assert snapshot["version"] == "investigation/v1"
     assert len(snapshot["sha256"]) == 64
     # 重新对实际初始消息计算指纹，不能只检查哈希长度，否则正文与审计身份可能脱节。
@@ -307,7 +346,7 @@ def test_langgraph_executes_real_tools_and_persists_trace(runtime):
     assert snapshot["messages"][0]["role"] == "system"
     assert snapshot["tools"][:-1] == tool_definitions()
     assert snapshot["tools"][-1]["function"]["name"] == "submit_report"
-    assert trace[1]["usage"]["prompt_tokens"] == 10
+    assert protocol[1]["usage"]["prompt_tokens"] == 10
 
 
 @pytest.mark.parametrize(

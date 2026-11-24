@@ -4,6 +4,7 @@ import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from threading import Lock
 from time import monotonic
 from typing import TypedDict
@@ -24,15 +25,19 @@ class ModelCallBudget:
     """Atomically share a run's request limit across the supervisor and its branches."""
 
     def __init__(self, limit: int):
+        self._limit = limit
         self._left = limit
         self._lock = Lock()
 
-    def claim(self, *, reserve: int) -> int | None:
+    def claim(self, *, reserve: int) -> tuple[bool, dict[str, int]]:
         with self._lock:
-            if self._left <= reserve:
-                return None
-            self._left -= 1
-            return self._left - reserve
+            accepted = self._left > reserve
+            if accepted:
+                self._left -= 1
+            return accepted, {
+                "limit": self._limit, "claimed": self._limit - self._left,
+                "remaining": self._left, "reserved_for_parent_report": reserve,
+            }
 
 
 class InvestigationState(TypedDict):
@@ -124,7 +129,9 @@ class InvestigationGraph:
     ) -> dict:
         """运行一个 Agent，直到提交报告或子调查发现。"""
         invalid_submissions = set()
-        recovery = InvestigationRecovery(initial_evidence_ids)
+        recovery = InvestigationRecovery(
+            partial(self.store.read_evidence, self.run_id), initial_evidence_ids,
+        )
         is_branch = deadline is not None
         memory_enabled = any(tool["function"]["name"] == "update_working_memory" for tool in tools)
         context_sequence = 0
@@ -142,39 +149,50 @@ class InvestigationGraph:
             nonlocal closing, context_sequence
             _remaining_time(deadline)
             history = state["messages"]
-            remaining = self.budget.claim(reserve=1 if is_branch else 0)
-            if remaining is None:
-                return {"messages": history, "report": fallback_report("model_call_budget")}
-            memory = memory_snapshot()
-            outgoing, manifest = assemble(history, memory, self.context_strategy)
-            available = tools
+            accepted, budget = self.budget.claim(reserve=1 if is_branch else 0)
             closing = recovery.failed_tool
-            if closing is None and recovery.stalled_rounds >= MAX_STALLED_ROUNDS:
-                closing = "no_progress"
-            if closing is None and remaining == 0:
+            if not accepted:
                 closing = "model_call_budget"
-            if closing is not None:
-                tool, = (tool for tool in tools if tool["function"]["name"] == final_tool)
-                manifest["report_only"] = closing
-                function = tool["function"]
-                instruction = {
-                    "model_call_budget": " 本轮是最后一次模型请求。",
-                    "no_progress": " 连续查询未获得新线索，请结束调查。",
-                }.get(closing, "")
-                available = [{
-                    **tool, "function": {
-                        **function,
-                        "description": function["description"] + instruction + " 请根据已有证据"
-                        "提交结果，明确标出缺少实测的结论和待查项。",
-                    },
-                }]
+            elif closing is None and recovery.stalled_rounds >= MAX_STALLED_ROUNDS:
+                closing = "no_progress"
+            elif closing is None and budget["remaining"] == budget["reserved_for_parent_report"]:
+                closing = "model_call_budget"
+            audit = {"model_budget": budget, "stalled_tool_batches": recovery.stalled_rounds}
+            budget_event = {
+                "type": "model_budget", **tags, **audit, "accepted": accepted, "report_only": closing,
+            }
+            try:
+                if not accepted:
+                    return {"messages": history, "report": fallback_report("model_call_budget")}
+                memory = memory_snapshot()
+                outgoing, manifest = assemble(history, memory, self.context_strategy)
+                manifest.update(audit)
+                available = tools
+                if closing is not None:
+                    tool, = (tool for tool in tools if tool["function"]["name"] == final_tool)
+                    manifest["report_only"] = closing
+                    function = tool["function"]
+                    instruction = {
+                        "model_call_budget": " 本轮是最后一次模型请求。",
+                        "no_progress": " 连续查询未获得新线索，请结束调查。",
+                    }.get(closing, "")
+                    available = [{
+                        **tool, "function": {
+                            **function,
+                            "description": function["description"] + instruction + " 请根据已有证据"
+                            "提交结果，明确标出缺少实测的结论和待查项。",
+                        },
+                    }]
 
-            # 先保存实际发送视图，网络错误也能对应到输入。
-            context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
-            if len(history) == len(messages):
-                self.store.trace(self.run_id, {
-                    "type": "prompt", **tags, **metadata, "context_sequence": context_sequence,
-                })
+                # 先保存实际发送视图，网络错误也能对应到输入。
+                context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
+                budget_event["context_sequence"] = context_sequence
+                if len(history) == len(messages):
+                    self.store.trace(self.run_id, {
+                        "type": "prompt", **tags, **metadata, "context_sequence": context_sequence,
+                    })
+            finally:
+                self.store.trace(self.run_id, budget_event)
             try:
                 message = self._request_message(outgoing, available, tags, context_sequence, deadline)
             except ModelError:

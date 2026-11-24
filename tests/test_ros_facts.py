@@ -74,12 +74,8 @@ def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path, topic_fact
         store.read_evidence(run["id"], evidence_id)
 
 
-def test_worker_replays_missing_facts_and_pending_tasks_after_restart(tmp_path, topic_fact, monkeypatch):
-    store = Store(tmp_path)
-    store.register(ApplicationContract(app_id="camera", components=["camera"]))
-    queued = store.ingest_ros_fact("camera", {**topic_fact, "sequence": 2})
-    fact_db = tmp_path / "ros-facts.db"
-    with closing(sqlite3.connect(fact_db)) as db, db:
+def write_fact_database(path, topic_fact, sequences):
+    with closing(sqlite3.connect(path)) as db, db:
         db.executescript("""
             PRAGMA journal_mode=WAL;
             PRAGMA application_id=1380930374;
@@ -92,26 +88,63 @@ def test_worker_replays_missing_facts_and_pending_tasks_after_restart(tmp_path, 
         db.execute("INSERT INTO source VALUES(1, ?, ?, ?)", (
             topic_fact["source_id"], topic_fact["app_id"], topic_fact["topic"],
         ))
-        for sequence in (1, 2):
+        for sequence in sequences:
             db.execute("INSERT INTO topic_silences VALUES(?, ?, ?, ?, ?)", (
                 sequence, topic_fact["observed_at_ms"], topic_fact["last_message_at_ms"],
                 topic_fact["silent_ms"], topic_fact["threshold_ms"],
             ))
+
+
+def test_worker_replays_missing_facts_and_pending_tasks_after_restart(tmp_path, topic_fact, monkeypatch):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    queued = store.ingest_ros_fact("camera", {**topic_fact, "sequence": 2})
+    fact_db = tmp_path / "ros-facts.db"
+    write_fact_database(fact_db, topic_fact, (1, 2, 3))
+    assert replay_facts(store, "camera", fact_db, limit=1) == 1
+    assert len(store.incidents()) == 2
 
     path = tmp_path / "facts.sock"
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as abandoned:
         abandoned.bind(str(path))
     assert path.is_socket()
     monkeypatch.setattr("robotops.ros_facts.DeepSeekClient", ScriptedClient)
+    monkeypatch.setattr("robotops.ros_facts.REPLAY_INTERVAL_SECONDS", 0.05)
     config = Config(data_dir=tmp_path)
     assert watch_facts(config, "camera", path, once=True, max_model_calls=6) == 0
     assert store.incident(queued)["automatic_task_state"] == "COMPLETED"
-    pending, = store.queued_ros_fact_incidents("camera")
+    pending, last = store.queued_ros_fact_incidents("camera")
     assert store.incident(pending)["ros_fact"] == topic_fact
     assert watch_facts(config, "camera", path, once=True, max_model_calls=6) == 0
     assert store.incident(pending)["automatic_task_state"] == "COMPLETED"
+    assert store.incident(last)["automatic_task_state"] == "QUEUED"
+    assert watch_facts(config, "camera", path, once=True, max_model_calls=6) == 0
+    assert store.incident(last)["automatic_task_state"] == "COMPLETED"
     assert replay_facts(store, "camera", fact_db) == 0
-    assert len(store.incidents()) == 2
+    assert len(store.incidents()) == 3
+
+
+def test_live_worker_picks_up_a_fact_without_a_datagram(tmp_path, topic_fact, monkeypatch):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    path = tmp_path / "facts.sock"
+    fact_db = tmp_path / "ros-facts.db"
+    monkeypatch.setattr("robotops.ros_facts.DeepSeekClient", ScriptedClient)
+    monkeypatch.setattr("robotops.ros_facts.REPLAY_INTERVAL_SECONDS", 0.05)
+    with ThreadPoolExecutor(max_workers=1) as receiver:
+        task = receiver.submit(
+            watch_facts, Config(data_dir=tmp_path), "camera", path, once=True, max_model_calls=6,
+        )
+        try:
+            wait_until(path.is_socket)
+            write_fact_database(fact_db, topic_fact, (1,))
+            assert task.result(timeout=4) == 0
+        finally:
+            if not task.done() and path.is_socket():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+                    sender.sendto(json.dumps(topic_fact).encode(), str(path))
+    incident, = store.incidents()
+    assert store.incident(incident["id"])["automatic_task_state"] == "COMPLETED"
 
 
 @pytest.mark.parametrize("limit, expected_calls, reason", [

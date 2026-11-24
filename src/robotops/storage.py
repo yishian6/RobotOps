@@ -301,13 +301,13 @@ class Store:
                     "UPDATE incidents SET state='NEEDS_HUMAN' WHERE id=?", (row["incident_id"],),
                 )
 
-    def queued_ros_fact_incidents(self, app_id: str) -> list[str]:
+    def queued_ros_fact_incidents(self, app_id: str, *, limit: int = -1) -> list[str]:
         """Find imported observations whose automatic investigations have not started."""
         with self.connection() as db:
             return [row[0] for row in db.execute(
                 "SELECT t.incident_id FROM ros_fact_tasks t JOIN incidents i ON i.id=t.incident_id "
-                "WHERE i.app_id=? AND i.state='OPEN' AND t.run_id IS NULL ORDER BY t.rowid",
-                (app_id,),
+                "WHERE i.app_id=? AND i.state='OPEN' AND t.run_id IS NULL ORDER BY t.rowid LIMIT ?",
+                (app_id, limit),
             )]
 
     def register_service(self, request: ServiceRegistration, observation: ServiceObservation) -> dict:

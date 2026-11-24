@@ -166,7 +166,7 @@ uv run --env-file .env robotops watch-ros-facts camera \
 build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 data/camera-ros-facts.sock data/ros-facts.db
 ```
 
-收到第一条 Topic 消息后开始监测，每段连续静默只写一条事实。C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。Worker 启动时只读事实库，补录漏接记录并派发已经入库、尚未开始的任务。回放与实时消息按来源和序号去重。停机时已开始的调查标记为中断失败，保留已有证据供复核。未指定 `--facts-db` 时，默认读取 `ROBOTOPS_DATA_DIR` 下的 `ros-facts.db`。
+收到第一条 Topic 消息后开始监测，每段连续静默只写一条事实。C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。Worker 启动及运行期间在后台分批补录漏接事实，每批最多 32 条，同时继续接收实时消息。回放与实时消息按来源和序号去重。待调查任务留在 SQLite 中，每次派发一条，`--once` 最多执行一次调查。停机时已开始的调查标记为中断失败，保留已有证据供复核。未指定 `--facts-db` 时，默认读取 `ROBOTOPS_DATA_DIR` 下的 `ros-facts.db`。
 
 在隔离测试应用中暂停该 Topic 的发布。Worker 会自动派发调查，并在完成后输出运行记录。核心 API、应用启动入口和 Worker 共用同一个 `ROBOTOPS_DATA_DIR`。启动 `uv run robotops serve` 之后，可以按下表查回完整链路。
 
@@ -176,6 +176,7 @@ build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 data/camera-r
 | `GET :8000/incidents/{id}` | 触发事实、自动任务状态和 `automatic_run_id` |
 | `GET :8000/runs/{run_id}` | 报告、运行状态或错误 |
 | `GET :8000/runs/{run_id}/evidence/{evidence_id}` | 报告引用的存证原文 |
+| `GET :8000/runs/{run_id}/usage` | 已占用、剩余、被拒绝的请求预算及模型实报用量 |
 
 自动调查默认最多调用模型六次。连续三批工具未获得新线索时提前进入收尾；达到预算时为报告保留最后一次请求。若收尾轮未提交有效报告，系统保存带已有证据引用的待人工研判结果。停发事实说明采集器在给定窗口内没有收到消息，根因需要结合其他现场证据研判。
 

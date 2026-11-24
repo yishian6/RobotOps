@@ -17,6 +17,7 @@ from robotops.agent.client import DeepSeekClient
 from robotops.agent.context import ContextSnapshots, aggregate_logs, assemble, canonical
 from robotops.agent.memory import MemoryStore, WorkingMemory
 from robotops.agent.supervision import RoleScope
+from robotops.agent.usage import summarize_usage
 from robotops.agent.workflow import investigate
 from robotops.api import create_app
 from robotops.config import Config
@@ -744,7 +745,24 @@ def test_transport_error_keeps_reported_usage(investigation):
     run = investigate(store, None, incident["id"], client.complete, "fixture")
     assert run["state"] == "FAILED"
     events = store.trace(run["id"])
-    assert events[1]["type"] == "model_error" and events[1]["usage"] == {"prompt_tokens": 19}
+    failed = next(e for e in events if e["type"] == "model_error")
+    assert failed["usage"] == {"prompt_tokens": 19}
+
+
+def test_claimed_budget_is_recorded_even_when_snapshot_save_fails(investigation, monkeypatch):
+    store, _, incident = investigation
+
+    def fail(*_args):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(ContextSnapshots, "save", fail)
+    run = investigate(store, None, incident["id"], fail, "fixture", max_model_calls=2)
+    assert run["state"] == "FAILED"
+    usage = summarize_usage(store.trace(run["id"]), [])
+    assert usage["recorded_attempts"] == usage["context_requests"] == 0
+    assert usage["model_budget"] == {
+        "limit": 2, "claimed": 1, "remaining": 1, "denied_claims": 0, "report_only": None,
+    }
 
 
 def test_case_is_never_accepted_as_current_root_cause(investigation):

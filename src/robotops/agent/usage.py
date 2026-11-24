@@ -72,8 +72,24 @@ def summarize_usage(events: list[dict], snapshots: list[dict]) -> dict:
         role: _totals(recorded[role], requests[role], pending[role])
         for role in sorted(requests.keys() | recorded.keys())
     }
+    reservations = [event for event in events if event["type"] == "model_budget"]
+    budget = None
+    if reservations:
+        # Threads can append events in a different order than they claimed slots.
+        latest = max(reservations, key=lambda event: event["model_budget"]["claimed"])["model_budget"]
+        main_claims = [
+            event for event in reservations
+            if event["accepted"] and not event["model_budget"]["reserved_for_parent_report"]
+        ]
+        main_latest = max(main_claims, key=lambda event: event["model_budget"]["claimed"], default={})
+        budget = {
+            **{key: latest[key] for key in ("limit", "claimed", "remaining")},
+            "denied_claims": sum(not event["accepted"] for event in reservations),
+            "report_only": main_latest.get("report_only"),
+        }
     return {
         **_totals(model_events, len(snapshots), sum(pending.values())),
         "includes_summary_calls": "summary" in by_role,
         "by_role": by_role,
+        "model_budget": budget,
     }
