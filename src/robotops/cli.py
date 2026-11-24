@@ -4,6 +4,7 @@
 
 import argparse
 import json
+from pathlib import Path
 from time import sleep
 
 from .agent.prompt_loader import load_investigation_prompt
@@ -32,16 +33,24 @@ def main():
     )
     monitor = commands.add_parser("monitor", help="Poll registered systemd services without a model")
     monitor.add_argument("--once", action="store_true", help="Poll once and print the results")
+    monitor.add_argument(
+        "--plan-recovery-for", metavar="APP_ID",
+        help="Record restart candidates for the selected registered service",
+    )
     facts = commands.add_parser(
-        "watch-ros-facts", help="Read local ROS 1 facts and automatically investigate new faults",
+        "watch-ros-facts", help="Receive local ROS 1 facts and automatically investigate new faults",
     )
     facts.add_argument("app_id")
-    facts.add_argument("--port", type=int, default=8081)
-    facts.add_argument("--once", action="store_true", help="Consume one page and exit")
+    facts.add_argument("--socket", type=Path, help="Path to the local Unix datagram socket")
+    facts.add_argument("--once", action="store_true", help="Investigate one new fact and exit")
     facts.add_argument("--max-model-calls", type=int, default=6, help="Maximum calls per automatic run")
     run = commands.add_parser(
-        "run", usage="robotops run APP_ID -- COMMAND [ARG ...]",
+        "run", usage="robotops run [--restart-on-exit] APP_ID -- COMMAND [ARG ...]",
         help="Register and run an application in the foreground",
+    )
+    run.add_argument(
+        "--restart-on-exit", action="store_true",
+        help="Restart an unexpectedly exited ROS 1 launch once",
     )
     run.add_argument("app_id")
     run.add_argument("argv", nargs=argparse.REMAINDER)
@@ -61,9 +70,14 @@ def main():
 
         config = Config.load()
         store, manager = Store(config.data_dir), SystemdServiceManager()
+        if args.plan_recovery_for is not None:
+            try:
+                store.services(args.plan_recovery_for)
+            except KeyError:
+                monitor.error("recovery planning requires a registered systemd application ID")
         try:
             while True:
-                results = poll_services(store, manager)
+                results = poll_services(store, manager, plan_recovery_for=args.plan_recovery_for)
                 if args.once:
                     print(json.dumps(results, ensure_ascii=False))
                     return
@@ -75,19 +89,18 @@ def main():
         except KeyboardInterrupt:
             return
     elif args.command == "watch-ros-facts":
-        from .agent.client import ModelError
         from .ros_facts import watch_facts
 
-        if not 0 < args.port <= 65535 or args.max_model_calls < 1:
-            facts.error("expected a valid port and a positive model-call budget")
+        if args.max_model_calls < 1:
+            facts.error("expected a positive model-call budget")
         try:
             return watch_facts(
-                Config.load(), args.app_id, args.port, once=args.once,
+                Config.load(), args.app_id, args.socket, once=args.once,
                 max_model_calls=args.max_model_calls,
             )
         except KeyboardInterrupt:
             return
-        except (KeyError, ModelError, BlockingIOError) as exc:
+        except (KeyError, OSError) as exc:
             facts.error(str(exc))
     elif args.command == "run":
         from .runner import run_application
@@ -96,7 +109,10 @@ def main():
         if not args.argv:
             run.error("expected an application command")
         try:
-            return run_application(Store(Config.load().data_dir), args.app_id, args.argv)
+            return run_application(
+                Store(Config.load().data_dir), args.app_id, args.argv,
+                restart_on_exit=args.restart_on_exit,
+            )
         except ValueError as exc:
             run.error(str(exc))
 

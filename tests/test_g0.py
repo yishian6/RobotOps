@@ -89,6 +89,35 @@ def assistant_call(name, arguments, call_id="call-1"):
     }
 
 
+@pytest.mark.parametrize("submits_report", [True, False])
+def test_last_request_reserves_the_report(runtime, submits_report):
+    store, observer, incident = runtime
+    requests = []
+
+    def complete(messages, tools):
+        requests.append(tools)
+        if len(requests) == 1:
+            names = {tool["function"]["name"] for tool in tools}
+            assert not names & {"get_application_contract", "update_working_memory"}
+            return assistant_call("get_application_contract", {})
+        evidence = json.loads(messages[-1]["content"])["evidence_id"]
+        if submits_report:
+            return assistant_call("submit_report", report([evidence]), "final")
+        return assistant_call("search_logs", {"keyword": "already examined"}, "over-budget")
+
+    run = investigate(store, observer, incident["id"], complete, "test-model", max_model_calls=2)
+    assert run["state"] == "COMPLETED"
+    assert run["report"]["status"] == "needs_human"
+    assert len(requests) == 2
+    final_tool, = requests[-1]
+    assert final_tool["function"]["name"] == "submit_report"
+    assert "最后一次" in final_tool["function"]["description"]
+    executed = [entry["tool"] for entry in store.trace(run["id"]) if entry["type"] == "tool"]
+    assert executed == (["get_application_contract", "submit_report"] if submits_report else [
+        "get_application_contract",
+    ])
+
+
 def test_contract_boundary():
     """
         验证路径型标识、额外命令字段、重复组件和无支持假设报告均不通过 Schema。

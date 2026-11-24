@@ -1,15 +1,16 @@
-"""Import observations over loopback and dispatch the corresponding read-only investigation."""
+"""Accept pushed observations over a local Unix socket and dispatch the corresponding read-only investigation."""
 
 import fcntl
 import json
+import socket
 import sys
-from http.client import HTTPConnection, HTTPException
-from time import sleep
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, model_validator
 
-from .agent.client import DeepSeekClient, ModelError
+from .agent.client import DeepSeekClient
 from .agent.prompt_loader import load_investigation_prompt
 from .agent.workflow import investigate
 from .config import Config
@@ -38,92 +39,31 @@ class TopicFact(Model):
         return self
 
 
-class FactBatch(FactSource):
-    events: list[TopicFact] = Field(max_length=100)
-
-    @model_validator(mode="after")
-    def check_order(self):
-        sequences = [event.sequence for event in self.events]
-        if sequences != sorted(set(sequences)):
-            raise ValueError("Fact sequence numbers must be unique and ascending")
-        return self
+class RosFact(FactSource, TopicFact):
+    """One compact observation per datagram."""
 
 
-def fetch_facts(store: Store, app_id: str, port: int) -> FactBatch:
-    """Read a bounded page of facts from the local collector, using its persisted identity."""
-    connection = HTTPConnection("127.0.0.1", port, timeout=2)
-
-    def read(path):
-        connection.request("GET", path)
-        with connection.getresponse() as response:
-            if response.status != 200:
-                raise ValueError(f"Collector responded with HTTP {response.status}")
-            body = response.read(65537)
-        if len(body) > 65536:
-            raise ValueError("Collector response exceeded 64 KiB")
-        return body
-
-    try:
-        source = FactSource.model_validate_json(read("/v1/source"))
-        if source.app_id != app_id:
-            raise ValueError("Collector belongs to a different application")
-        cursor = store.ros_fact_cursor(source.source_id)
-        batch = FactBatch.model_validate_json(read(f"/v1/events/{cursor}"))
-        if source != FactSource.model_validate(batch.model_dump(exclude={"events"})):
-            raise ValueError("Collector identity changed while reading events")
-        if batch.events and batch.events[0].sequence <= cursor:
-            raise ValueError("Collector returned events outside the requested page")
-        return batch
-    finally:
-        connection.close()
-
-
-def dispatch_facts(
-    store: Store, config: Config, batch: FactBatch, complete, *, max_model_calls: int = 6,
-) -> list[dict]:
-    """Persist facts as tasks, then run each pending task once with a bounded model budget."""
-    scope = batch.model_dump(exclude={"events"})
-    store.ingest_ros_facts(batch.app_id, [{**scope, **event.model_dump()} for event in batch.events])
-    return _run_pending_facts(store, config, batch.app_id, complete, max_model_calls)
-
-
-def _run_pending_facts(
-    store: Store, config: Config, app_id: str, complete, max_model_calls: int,
-) -> list[dict]:
-    """Investigate persisted observations independently of the collector connection."""
-    pending = store.pending_ros_facts(app_id)
-    if not pending:
-        return []
+def investigate_fact(
+    store: Store, config: Config, incident_id: str, complete, max_model_calls: int,
+) -> dict | None:
     prompt = load_investigation_prompt(config.prompt_version, config.prompts_dir)
-    results = []
-    for incident_id in pending:
-        calls = 0
-
-        def bounded_complete(messages, tools):
-            nonlocal calls
-            if calls >= max_model_calls:
-                raise ModelError("Automatic ROS investigation model-call budget exhausted")
-            calls += 1
-            return complete(messages, tools)
-
-        try:
-            result = investigate(
-                store, None, incident_id, bounded_complete, config.model, prompt,
-                config.context_strategy, automatic=True,
-            )
-        except ConflictError:
-            # A running manual investigation or a concurrent auto worker owns this event.
-            continue
-        results.append(result)
-    return results
+    try:
+        return investigate(
+            store, None, incident_id, complete, config.model, prompt,
+            config.context_strategy, automatic=True, max_model_calls=max_model_calls,
+        )
+    except ConflictError:
+        # A manual investigation can already own the event.
+        return None
 
 
 def watch_facts(
-    config: Config, app_id: str, port: int, *, once: bool, max_model_calls: int,
+    config: Config, app_id: str, socket_path: Path | None, *, once: bool, max_model_calls: int,
 ) -> int:
-    """Run one worker for a registered app, recovering interrupted runs on restart."""
+    """Receive live observations while a single background worker handles investigations."""
     store = Store(config.data_dir)
     store.contract(app_id)
+    path = socket_path or store.root / f"{app_id}-ros-facts.sock"
     model = None
 
     def complete(messages, tools):
@@ -132,23 +72,40 @@ def watch_facts(
             model = DeepSeekClient(config)
         return model.complete(messages, tools)
 
+    def run_and_print(incident_id):
+        try:
+            result = investigate_fact(store, config, incident_id, complete, max_model_calls)
+        except (OSError, ValueError) as exc:
+            print(f"ROS 1 investigation unavailable: {exc}", file=sys.stderr)
+            return
+        if result is not None:
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+
     with (store.root / f".ros-facts-{app_id}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        store.interrupt_ros_fact_runs(app_id)
-        while True:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+            listener.bind(str(path))
             try:
-                batch = fetch_facts(store, app_id, port)
-            except (OSError, HTTPException, ValueError) as exc:
-                print(f"ROS 1 observation unavailable: {exc}", file=sys.stderr)
-                exit_status = 1
-                runs = _run_pending_facts(store, config, app_id, complete, max_model_calls)
-            else:
-                exit_status = 0
-                runs = dispatch_facts(
-                    store, config, batch, complete, max_model_calls=max_model_calls,
-                )
-            for run in runs:
-                print(json.dumps(run, ensure_ascii=False), flush=True)
-            if once:
-                return exit_status
-            sleep(config.monitor_interval_seconds)
+                path.chmod(0o600)
+                store.interrupt_ros_fact_runs(app_id)
+                with ThreadPoolExecutor(max_workers=1) as worker:
+                    while True:
+                        payload = listener.recv(4097)
+                        try:
+                            if len(payload) > 4096:
+                                raise ValueError("ROS fact exceeded 4 KiB")
+                            fact = RosFact.model_validate_json(payload)
+                            if fact.app_id != app_id:
+                                raise ValueError("ROS fact belongs to a different application")
+                        except ValueError as exc:
+                            print(f"Invalid ROS 1 observation: {exc}", file=sys.stderr)
+                            continue
+                        incident_id = store.ingest_ros_fact(app_id, fact.model_dump())
+                        if incident_id is None:
+                            continue
+                        if once:
+                            run_and_print(incident_id)
+                            return 0
+                        worker.submit(run_and_print, incident_id)
+            finally:
+                path.unlink(missing_ok=True)

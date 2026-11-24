@@ -69,14 +69,17 @@ class InvestigationRecovery:
             "next_step": "Finish the report with available evidence. Mark unresolved findings needs_human.",
         }
 
-    def fallback_report(self) -> dict:
+    def fallback_report(self, closing_reason: str) -> dict:
         """
             生成保守的人工复核报告，供模型无法在收尾轮交付有效报告时使用。
 
             Returns:
                 dict: 已通过业务结构校验的 needs_human 报告。
         """
-        reason = f"{self.failed_tool} 反复返回同类错误或跳过结果，调查已用现有证据收尾。"
+        if closing_reason == "model_call_budget":
+            reason = "调查已达到模型请求上限，收尾轮未提交有效报告。请复核已有观测和待查项。"
+        else:
+            reason = f"{closing_reason} 反复返回同类错误或跳过结果，调查已用现有证据收尾。"
         return DiagnosticReport.model_validate({
             "status": "needs_human",
             "summary": reason,

@@ -35,10 +35,20 @@ def launch(argv, events):
         roslaunch.main(["roslaunch", *argv])
         return
 
+    def send_event(event):
+        try:
+            events.send(json.dumps(event, ensure_ascii=False).encode())
+        except OSError as exc:
+            # 事件上报失败时，ROS 继续它自己的启动和关停流程。
+            print(f"[robotops] could not report ROS launch event: {exc}", file=sys.stderr, flush=True)
+
     class ExitListener(pmon.ProcessListener):
         """
             将 Noetic 主动报告的异常退出写到独立通道。
         """
+
+        def __init__(self, monitor=None):
+            self.monitor = monitor
 
         def process_died(self, process_name, exit_code):
             """
@@ -52,11 +62,11 @@ def launch(argv, events):
                     None: 事件独立于节点的任意文本输出发送。
             """
             if exit_code is not None and exit_code != 0:
-                try:
-                    events.send(json.dumps([process_name[:1024], exit_code], ensure_ascii=False).encode())
-                except OSError as exc:
-                    # 回调失败由终端提示，避免异常传回 process monitor 中断 ROS 自己的清理。
-                    print(f"[robotops] could not report ROS exit: {exc}", file=sys.stderr, flush=True)
+                process = self.monitor.get_process(process_name) if self.monitor is not None else None
+                send_event({
+                    "type": "exit", "name": process_name[:1024], "code": exit_code,
+                    "required": process is not None and process.required,
+                })
 
     class ObservedLaunch(parent.ROSLaunchParent):
         """
@@ -71,9 +81,8 @@ def launch(argv, events):
                     None: 退出监听器已注册到本地进程监控和远程回调入口。
             """
             super()._init_runner()
-            listener = ExitListener()
-            self.pm.add_process_listener(listener)
-            self.server.add_process_listener(listener)
+            self.pm.add_process_listener(ExitListener(self.pm))
+            self.server.add_process_listener(ExitListener())
 
     if options.wait_for_master and not options.core:
         rlutil._wait_for_master()
@@ -99,6 +108,7 @@ def launch(argv, events):
     roslaunch.write_pid_file(options.pid_fn, options.core, options.port)
     try:
         launcher.start()
+        send_event({"type": "started"})
         launcher.spin()
     finally:
         launcher.shutdown()

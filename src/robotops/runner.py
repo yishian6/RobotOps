@@ -13,9 +13,12 @@ import subprocess
 import sys
 from contextlib import ExitStack
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
 from .storage import Store
+
+LAUNCH_STABILITY_SECONDS = 5
 
 
 def _roslaunch_command(argv: list[str], event_fd: int) -> list[str]:
@@ -68,7 +71,9 @@ def _drain_output(stream, selector: selectors.BaseSelector, log) -> None:
         sys.stdout.buffer.flush()
 
 
-def run_application(store: Store, app_id: str, argv: list[str]) -> int:
+def run_application(
+    store: Store, app_id: str, argv: list[str], *, restart_on_exit: bool = False,
+) -> int:
     """
         一次命令完成登记、前台运行、输出保存和异常退出入库。
 
@@ -76,18 +81,37 @@ def run_application(store: Store, app_id: str, argv: list[str]) -> int:
             store: 运行与 API 共用的本地存储。
             app_id: 操作员指定的应用标识。
             argv: 要执行的程序及参数，直接传给子进程。
+                restart_on_exit: 允许同一 ROS 1 launch 在异常退出后重启一次。
 
         Returns:
             int: 启动命令的 shell 退出状态，信号退出使用 128 加信号编号。
     """
+    if restart_on_exit and (Path(argv[0]).name != "roslaunch" or "-" in argv[1:]):
+        raise ValueError("--restart-on-exit requires a roslaunch command with a launch file")
+    status, failure = _run_once(store, app_id, argv)
+    if restart_on_exit and failure is not None:
+        incident_id, _ = failure
+        print(f"[robotops] restarting {app_id} once for {incident_id}", file=sys.stderr, flush=True)
+        status, failure = _run_once(store, app_id, argv, restart_of=incident_id)
+        if not status and failure is not None:
+            status = failure[1]
+    return 128 - status if status < 0 else status
+
+
+def _run_once(
+    store: Store, app_id: str, argv: list[str], *, restart_of: str | None = None,
+) -> tuple[int, tuple[str, int] | None]:
     execution_id = f"exec-{uuid4().hex}"
     log_dir = store.root / "executions"
     log_dir.mkdir(mode=0o700, exist_ok=True)
     log_path = log_dir / f"{execution_id}.log"
-    store.start_execution(app_id, execution_id)
+    store.start_execution(app_id, execution_id, restart_of=restart_of)
     process_name = Path(argv[0]).name
     stop_signal: int | None = None
     process = None
+    required_failure = None
+    verify_at = None
+    verified = False
 
     def stop(signum, _frame):
         """
@@ -122,10 +146,11 @@ def run_application(store: Store, app_id: str, argv: list[str]) -> int:
                     code: 原始进程退出码。
 
                 Returns:
-                    None: 事件已持久化。
+                    str: 本次故障的事件编号。
             """
             incident_id = store.record_execution_exit(execution_id, name, code, log.tell())
             print(f"[robotops] {name} exited ({code}), incident {incident_id}", file=sys.stderr, flush=True)
+            return incident_id
 
         selector = resources.enter_context(selectors.DefaultSelector())
         receiver = sender = None
@@ -157,7 +182,9 @@ def run_application(store: Store, app_id: str, argv: list[str]) -> int:
             print(message, file=sys.stderr, flush=True)
             record_exit(process_name, status)
             store.finish_execution(execution_id, status)
-            return status
+            if restart_of is not None:
+                store.finish_launch_restart(execution_id, "FAILED")
+            return status, None
         if sender is not None:
             sender.close()
         if stop_signal is not None:
@@ -179,11 +206,23 @@ def run_application(store: Store, app_id: str, argv: list[str]) -> int:
                 if receiver in readable:
                     for _ in range(32):
                         try:
-                            name, code = json.loads(receiver.recv(8192))
+                            event = json.loads(receiver.recv(8192))
                         except BlockingIOError:
                             break
-                        # Noetic 回调排除由 launcher 正常关停时停止的节点。
-                        record_exit(name, code)
+                        if event["type"] == "started":
+                            if restart_of is not None:
+                                verify_at = monotonic() + LAUNCH_STABILITY_SECONDS
+                        else:
+                            # Noetic 回调排除由 launcher 正常关停时停止的节点。
+                            incident_id = record_exit(event["name"], event["code"])
+                            if event["required"]:
+                                required_failure = (incident_id, event["code"])
+                if (
+                    verify_at is not None and not verified and stop_signal is None
+                    and required_failure is None and monotonic() >= verify_at and process.poll() is None
+                ):
+                    store.finish_launch_restart(execution_id, "STABLE")
+                    verified = True
                 if returncode is not None and receiver is None:
                     # 普通程序可能把输出描述符留给后台后代，不等它们关闭才交还终端。
                     break
@@ -197,7 +236,16 @@ def run_application(store: Store, app_id: str, argv: list[str]) -> int:
                     process.kill()
             returncode = process.wait()
             store.finish_execution(execution_id, returncode)
+            if restart_of is not None and not verified:
+                store.finish_launch_restart(
+                    execution_id, "INTERRUPTED" if stop_signal is not None else "FAILED",
+                )
 
-        if returncode and stop_signal is None:
-            record_exit(process_name, returncode)
-        return 128 - returncode if returncode < 0 else returncode
+        if stop_signal is not None:
+            return returncode, None
+        if returncode:
+            launch_failure = (record_exit(process_name, returncode), returncode)
+            return returncode, required_failure or launch_failure
+        if required_failure is not None:
+            return returncode, required_failure
+        return (1 if restart_of is not None and not verified else 0), None

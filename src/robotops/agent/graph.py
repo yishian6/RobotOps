@@ -16,6 +16,8 @@ from .client import AssistantMessage, DeepSeekClient, ModelError
 from .context import ContextSnapshots, Strategy, assemble
 from .recovery import OPTIONAL_TOOLS, InvestigationRecovery
 
+DEFAULT_MAX_MODEL_CALLS = 8
+
 
 class InvestigationState(TypedDict):
     """保留单个 Agent 的完整消息历史和已校验结果。"""
@@ -102,30 +104,60 @@ class InvestigationGraph:
         final_tool: str,
         deadline: float | None = None,
         initial_evidence_ids: tuple[str, ...] = (),
+        max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
     ) -> dict:
         """运行一个 Agent，直到提交报告或子调查发现。"""
         invalid_submissions = set()
         recovery = InvestigationRecovery(initial_evidence_ids) if deadline is None else None
+        memory_enabled = any(tool["function"]["name"] == "update_working_memory" for tool in tools)
+        model_calls = 0
+        context_sequence = 0
+
+        def closing_reason():
+            if recovery is not None and recovery.failed_tool:
+                return recovery.failed_tool
+            return "model_call_budget" if model_calls >= max_model_calls else None
+
+        def fallback_report(reason):
+            if recovery is None:
+                raise ModelError("Domain investigation reached its model-call limit without a valid finding")
+            return recovery.fallback_report(reason)
 
         def call_model(state: InvestigationState) -> InvestigationState:
+            nonlocal model_calls, context_sequence
             _remaining_time(deadline)
+            model_calls += 1
             history = state["messages"]
             memory = memory_snapshot()
             outgoing, manifest = assemble(history, memory, self.context_strategy)
             available = tools
-            closing = recovery if recovery is not None and recovery.failed_tool else None
+            closing = closing_reason()
             if closing is not None:
                 available = [tool for tool in tools if tool["function"]["name"] == final_tool]
-                manifest["report_only"] = closing.failed_tool
+                manifest["report_only"] = closing
+            if closing == "model_call_budget":
+                tool, = available
+                function = tool["function"]
+                available = [{
+                    **tool, "function": {
+                        **function,
+                        "description": function["description"] + " 本轮是最后一次模型请求，请根据"
+                        "已有证据提交结果，明确标出缺少实测的结论和待查项。",
+                    },
+                }]
 
             # 先保存实际发送视图，网络错误也能对应到输入。
-            sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
+            context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
+            if len(history) == len(messages):
+                self.store.trace(self.run_id, {
+                    "type": "prompt", **tags, **metadata, "context_sequence": context_sequence,
+                })
             try:
-                message = self._request_message(outgoing, available, tags, sequence, deadline)
+                message = self._request_message(outgoing, available, tags, context_sequence, deadline)
             except ModelError:
                 if closing is None:
                     raise
-                return {"messages": history, "report": closing.fallback_report()}
+                return {"messages": history, "report": fallback_report(closing)}
 
             # 迟到回复只记用量，不能推进调查。
             _remaining_time(deadline)
@@ -137,7 +169,7 @@ class InvestigationGraph:
             if len(ids) != len(calls) or ids & past_ids:
                 if closing is None:
                     raise ModelError("Duplicate tool call IDs")
-                return {"messages": history, "report": closing.fallback_report()}
+                return {"messages": history, "report": fallback_report(closing)}
 
             report = None
             if not calls:
@@ -146,18 +178,18 @@ class InvestigationGraph:
                 except ModelError:
                     if closing is None:
                         raise
-                    report = closing.fallback_report()
+                    report = fallback_report(closing)
             elif closing is not None and (
                 len(calls) != 1 or calls[0]["function"]["name"] != final_tool
             ):
-                report = closing.fallback_report()
+                report = fallback_report(closing)
             return {"messages": [*history, message], "report": report}
 
         def run_tools(state: InvestigationState) -> InvestigationState:
             history = list(state["messages"])
             calls = history[-1]["tool_calls"]
             report = None
-            closing = recovery if recovery is not None and recovery.failed_tool else None
+            closing = closing_reason()
             # 同批按顺序执行，让后面的调用能读取前面保存的证据和记忆。
             for call in calls:
                 _remaining_time(deadline)
@@ -181,6 +213,11 @@ class InvestigationGraph:
                         result = {"status": "error", "error": str(exc)}
                     else:
                         result = {"status": "ok"}
+                elif name == "update_working_memory" and not memory_enabled:
+                    result = {
+                        "status": "error", "error": "Working memory is disabled for this investigation",
+                        "next_step": "Use the current evidence and submit the result when ready.",
+                    }
                 elif recovery is not None and recovery.failed_tool and name in OPTIONAL_TOOLS:
                     result = {
                         "status": "blocked",
@@ -197,8 +234,14 @@ class InvestigationGraph:
                     result = recovery.record(name, result)
                     if not failed_tool and recovery.failed_tool:
                         self.store.trace(self.run_id, {"type": "report_only", **tags, "tool": name})
+                trace_result = result
+                if result.get("evidence_id"):
+                    trace_result = {key: value for key, value in result.items() if key != "data"}
+                elif name == "read_evidence" and result.get("status") == "ok":
+                    trace_result = {key: value for key, value in result.items() if key != "raw"}
                 self.store.trace(self.run_id, {
-                    "type": "tool", **tags, "tool": name, "arguments": arguments, "result": result,
+                    "type": "tool", **tags, "tool": name, "tool_call_id": call["id"],
+                    "context_sequence": context_sequence, "result": trace_result,
                 })
                 history.append({
                     "role": "tool",
@@ -206,7 +249,7 @@ class InvestigationGraph:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
             if closing is not None and report is None:
-                report = closing.fallback_report()
+                report = fallback_report(closing)
             return {"messages": history, "report": report}
 
         graph = StateGraph(InvestigationState)
@@ -221,9 +264,6 @@ class InvestigationGraph:
         )
         graph.add_conditional_edges("tools", lambda state: END if state["report"] else "model")
 
-        self.store.trace(self.run_id, {
-            "type": "prompt", **tags, **metadata, "messages": messages, "tools": tools,
-        })
         # 由分支截止时间和调查收尾规则结束运行，避免框架默认步数提前截断。
         result = graph.compile().invoke(
             {"messages": messages, "report": None}, {"recursion_limit": sys.maxsize},

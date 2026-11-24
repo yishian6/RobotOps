@@ -1,6 +1,5 @@
 """建立只读调查、校验诊断报告并保存运行结果。"""
 
-from datetime import datetime, timezone
 from functools import partial
 from typing import Literal, get_args
 
@@ -13,7 +12,7 @@ from ..storage import Store
 from ..tools import ToolGateway, tool_definitions
 from .client import ModelError
 from .context import ContextSnapshots, Strategy
-from .graph import InvestigationGraph
+from .graph import DEFAULT_MAX_MODEL_CALLS, InvestigationGraph
 from .memory import MemoryStore
 from .prompt_loader import InvestigationPrompt, investigation_messages, load_investigation_prompt
 from .supervision import RolePrompts, Supervision, load_role_prompts
@@ -24,7 +23,9 @@ DEFAULT_API_MODE: InvestigationMode = "single"
 SUBMIT_REPORT = "submit_report"
 _REPORT_INSTRUCTION = (
     "先查能区分故障假设的现场观测。初始消息已有应用契约。历史案例和工作记忆按需使用。"
-    "能说明故障现象、范围和下一步时，单独通过 submit_report 提交，未证实的机制列为待查。"
+    "完整日志已经查过时，只为验证新的时间范围或新线索再查。"
+    "能说明故障现象、范围和下一步时，跳过记忆更新，直接通过 submit_report 提交。"
+    "未证实的机制列为待查。"
 )
 
 
@@ -70,10 +71,7 @@ def _with_trigger_evidence(store: Store, run_id: str, incident: dict) -> tuple[d
     fact = incident.get("ros_fact")
     if fact is None:
         return incident, None
-    observed_at = datetime.fromtimestamp(fact["observed_at_ms"] / 1000, timezone.utc).isoformat()
-    evidence_id = store.save_evidence(run_id, "ros1_topic_observation", {
-        "status": "ok", "observed_at": observed_at, "data": fact,
-    })
+    evidence_id = store.save_ros_fact_evidence(run_id, fact)
     return {
         **incident, "ros_fact": {**fact, "evidence_id": evidence_id},
         "investigation_goal": (
@@ -96,6 +94,7 @@ def investigate(
     *,
     branch_timeout_seconds: float = Config.branch_timeout_seconds,
     automatic: bool = False,
+    max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
 ):
     """运行只读调查并返回持久化记录。
 
@@ -106,6 +105,8 @@ def investigate(
     contract = store.contract(incident["app_id"])
     if mode not in INVESTIGATION_MODES:
         raise ValueError("Unknown investigation mode")
+    if type(max_model_calls) is not int or max_model_calls < 1:
+        raise ValueError("Model-call budget must be a positive integer")
     report_instruction = _REPORT_INSTRUCTION
     if mode == "supervised":
         role_prompts = role_prompts or load_role_prompts()
@@ -146,6 +147,12 @@ def investigate(
             tools, execute, role = tool_definitions(), gateway.execute, "single"
             visible_evidence = None
 
+        # 初始任务已经携带契约。保留显式 v1 基线用于既有的对照运行。
+        if prompt.version != "investigation/v1":
+            omitted = {"get_application_contract"}
+            if mode == "single" and max_model_calls <= DEFAULT_MAX_MODEL_CALLS:
+                omitted.add("update_working_memory")
+            tools = [tool for tool in tools if tool["function"]["name"] not in omitted]
         report = graph.run(
             messages, [*tools, report_tool], execute,
             partial(
@@ -154,6 +161,7 @@ def investigate(
             ),
             memory.current, {"agent_role": role, "investigation_mode": mode}, metadata,
             final_tool=SUBMIT_REPORT, initial_evidence_ids=initial_evidence,
+            max_model_calls=max_model_calls,
         )
         store.finish_run(run_id, report=report)
     except Exception as exc:

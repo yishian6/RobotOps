@@ -89,6 +89,7 @@ def test_service_registration_and_detection_share_sqlite(tmp_path):
         assert len(client.get("/incidents").json()) == 1
         incident = client.get(f"/incidents/{incident_id}").json()
         assert incident["source"] == "detector" and incident["state"] == "OPEN"
+        assert "recovery_action" not in incident
         exit_record = incident["service_exit"]
         assert exit_record["occurrences"] == 2
         assert exit_record["first_instance_id"] == exit_record["latest_instance_id"] == "before"
@@ -143,6 +144,50 @@ def test_concurrent_failed_observations_share_one_incident(tmp_path):
         assert sum(future.result()["created"] for future in futures) == 1
     incident, = store.incidents()
     assert store.incident(incident["id"])["service_exit"]["occurrences"] == 1
+
+
+def test_monitor_records_one_recovery_action_for_the_selected_service(tmp_path):
+    store = Store(tmp_path)
+    target = store.register_service(
+        ServiceRegistration(unit=UNIT, scope="user"),
+        sample("running", instance_id="before"),
+    )
+    other_unit = "other.service"
+    other = store.register_service(
+        ServiceRegistration(unit=other_unit), sample("running", unit=other_unit),
+    )
+    manager = Mock(spec=SystemdServiceManager)
+    offset = 1
+
+    def failed_reading(request):
+        return sample("failed", offset, unit=request.unit, result="exit-code")
+
+    manager.inspect.side_effect = failed_reading
+    rows = poll_services(store, manager, plan_recovery_for=target["app_id"])
+    incidents = {row["app_id"]: row["incident_id"] for row in rows}
+    incident_id = incidents[target["app_id"]]
+    action = store.incident(incident_id)["recovery_action"]
+    assert action["kind"] == "restart_service"
+    assert action["state"] == "AWAITING_AUTHORIZATION"
+    assert action["unit"] == UNIT and action["scope"] == "user"
+    assert action["config_version"] == target["config_version"]
+    assert action["failed_instance_id"] == "before"
+    assert action["basis"] == failed_reading(ServiceRegistration(unit=UNIT)).model_dump(mode="json")
+    assert "recovery_action" not in store.incident(incidents[other["app_id"]])
+    assert "restart" not in [call[0] for call in manager.method_calls]
+
+    offset = 2
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        checks = [
+            executor.submit(poll_services, Store(tmp_path), manager, plan_recovery_for=target["app_id"])
+            for _ in range(2)
+        ]
+        assert all(not row["created"] for check in checks for row in check.result())
+    reloaded = Store(tmp_path)
+    assert reloaded.incident(incident_id)["recovery_action"] == action
+    assert reloaded.incident(incident_id)["state"] == "OPEN"
+    with reloaded.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM recovery_actions").fetchone()[0] == 1
 
 
 def test_systemd_inspect_is_read_only_and_reports_unavailable(monkeypatch):

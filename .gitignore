@@ -13,9 +13,11 @@ data/
 # 所有环境文件仅保留在本地，包括示例文件。
 .env*
 
-# 本地设计、分析与开发记录不随源码提交，仅保留根目录 README。
-/doc/
+# 本地实录、设计草稿和开发记录不随源码提交。
+/doc/*
 *.md
 !/README.md
+!/doc/RobotOps_当前版本汇报.md
+!/doc/RobotOps_上下文管理.md
 .vscode
 .codegraph

@@ -4,12 +4,13 @@
 
 RobotOps 监测已登记的应用。ROS 1 Topic 停发时，C++ 采集器记录现场事实，Python Worker 自动创建故障事件并发起只读调查。报告的证据引用可以回查到这次停发的原始观测。
 
-当前版本 **0.2.0** 支持三条接入路径：
+当前版本 **0.2.0** 覆盖以下场景。
 
 | 场景 | 当前行为 |
 |---|---|
 | ROS 1 Noetic Topic 停发 | 自动采集事实、创建事件和调查任务，生成带证据的报告 |
 | 普通命令、ROS 1 launch 或 systemd 服务异常退出 | 自动记录退出事件，可以通过 API 发起只读调查 |
+| 已显式允许重启的 ROS 1 launch | 整个启动异常结束后可重启一次，记录新实例的启动验收 |
 | 本地 UDP pipeline | 可复现输入断流、处理停滞、配置不匹配和进程退出，提供无需模型密钥的离线回归 |
 
 ## 工作流程
@@ -18,7 +19,7 @@ RobotOps 监测已登记的应用。ROS 1 Topic 停发时，C++ 采集器记录�
 flowchart LR
     A["ROS 1 Topic"] --> B["C++ 采集器记录停发事实"]
     B --> F[("ros-facts.db")]
-    F -->|"本机只读 HTTP"| C["Python Worker 创建事件和调查任务"]
+    F -->|"本机 Unix Socket 推送"| C["Python Worker 创建事件和调查任务"]
     X["普通进程、ROS 1 子节点或 systemd 退出"] --> Y["记录退出事件"]
     Y -->|"API 手动发起"| D["Agent 只读调查"]
     C --> D
@@ -27,9 +28,11 @@ flowchart LR
     E --> R
 ```
 
-- **两个 SQLite 文件。** C++ 管理 `ros-facts.db`，保存带时间和来源的现场事实。Python 管理 `runtime.db`，保存事件、任务、运行和证据索引。同一事实按来源和序号去重。
-- **只读取证。** 默认单 Agent。手动调查可选层级式模式，将应用和系统检查分派给独立分支。工具网关验证参数、应用范围和证据归属，支持通过 SQLite FTS5 检索适用的历史案例。
+- **两个 SQLite 文件。** C++ 管理 `ros-facts.db`，保存带时间和来源的现场事实。Python 管理 `runtime.db`，保存事件、任务、运行和证据索引。同一事实按来源和序号去重。Python 证据引用任务里的触发事实，逐轮快照通过引用共享消息、系统提示词和工具定义。
+- **只读取证。** 默认单 Agent 直接使用任务里的应用契约，短调查关闭工作记忆写入。日志已完整读取的时段复用证据，要查新增日志时通过 `since` 指定起点。手动调查可选层级式模式。工具网关校验范围和证据归属，历史案例通过 SQLite FTS5 检索。
 - **调查可追溯。** 保存原始证据、逐轮模型输入、工具调用和用量。报告可以给出有证据支持的结论，亦可标记需要进一步研判。
+
+本版实现和验证记录见 [当前版本汇报](doc/RobotOps_当前版本汇报.md) 与 [上下文管理](doc/RobotOps_上下文管理.md)。
 
 ## 快速开始
 
@@ -89,6 +92,18 @@ curl -fsS "http://127.0.0.1:8000/incidents/${INCIDENT_ID}/logs"
 
 主动发起该事件的调查时，Agent 可以按关键词查询这份日志并引用原始证据。登记、运行和查看日志均可离线使用。
 
+### 为一个独立的 ROS 1 launch 启用一次重启
+
+在已加载 Noetic 和工作空间的终端，对允许重启的长期运行模块显式加上选项。
+
+```bash
+robotops run --restart-on-exit camera -- roslaunch camera_driver camera.launch
+```
+
+整个 `roslaunch` 非零退出，或本机标为 `required="true"` 的节点非零退出并令该 launch 结束时，Runner 用同一启动参数重启一次。已有 `respawn="true"` 的普通节点仍由 `roslaunch` 拉起。前台操作员发出的停止信号照常转发，停止后本次命令结束。
+
+`GET /incidents/{id}` 的 `launch_restart` 将原故障连到新一轮执行。新 launch 完成启动并持续存活 5 秒后记为 `STABLE`，提前退出记为 `FAILED`，验收前主动停止记为 `INTERRUPTED`。这一状态描述启动进程，原事件仍供调查。Topic 停发走下方的取证流程，业务恢复需要看到原 Topic 持续有新消息。
+
 ## 监测已有 Linux 服务
 
 分别启动核心 API 和监测进程。两者使用同一个数据目录。
@@ -119,31 +134,44 @@ curl -fsS http://127.0.0.1:8000/incidents
 uv run python -m robotops_examples.systemd_smoke
 ```
 
+### 记录待授权的恢复动作
+
+用服务登记返回的 `app_id` 启动监测。指定服务确认意外退出时，事件详情中的 `recovery_action` 会记录固定重启目标、故障实例和现场读数。持续失败复用同一条记录，动作状态为 `AWAITING_AUTHORIZATION`。
+
+```bash
+uv run robotops monitor --plan-recovery-for "$APP_ID"
+```
+
 ## 用 ROS 1 Topic 触发自动调查
 
 先用上面的 `robotops run` 接入应用并启动它的 ROS 1 launch。各终端使用同一个 `ROS_MASTER_URI`。下面以已登记的 `camera` 和 `/camera/image_raw` 为例，替换成实际应用 ID 和一个**应持续更新**的 Topic。
 
-### 构建并启动 C++ 采集器
+### 构建采集器
 
 ```bash
 source /opt/ros/noetic/setup.bash
 cmake -S cpp/ros1_facts -B build/ros1_facts -DPYTHON_EXECUTABLE=/usr/bin/python3
 cmake --build build/ros1_facts --parallel 2
 mkdir -p data
-
-# 应用名、Topic、静默阈值（ms）、本机端口、C++ 事实库
-build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 8081 data/ros-facts.db
 ```
 
-构建需要 C++17、CMake 3.16+、Noetic 的 `roscpp` 和 `topic_tools`，以及 SQLite3、Boost.System 和 nlohmann/json 的开发文件。采集器收到第一条消息后开始监测，每次连续静默只记录一条事实。HTTP 监听在 `127.0.0.1`。
+构建需要 C++17、CMake 3.16+、Noetic 的 `roscpp`、`topic_tools` 和 SQLite3、nlohmann/json 的开发文件。可运行 `build/ros1_facts/robotops_ros1_facts --init-db data/ros-facts.db` 提前建立事实库。Python 初始化业务存储时会建立 `data/runtime.db`。
 
-### 启动自动调查并查看结果
+### 启动自动调查和 C++ 采集器
 
-在同一个仓库目录的另一个终端启动 Worker。以下命令从本地 `.env` 加载 `DEEPSEEK_API_KEY`。如果密钥已经导出到环境变量，使用 `uv run robotops watch-ros-facts …` 即可。
+用同一个 Linux 用户，从仓库根目录先启动 Worker。示例从本地 `.env` 加载 `DEEPSEEK_API_KEY`。如果密钥已经导出，可省略 `--env-file .env`。
 
 ```bash
-uv run --env-file .env robotops watch-ros-facts camera --port 8081 --max-model-calls 6
+uv run --env-file .env robotops watch-ros-facts camera --socket data/camera-ros-facts.sock
 ```
+
+另开一个终端，加载 Noetic 后启动采集器。最后两个参数分别是本机 Socket 和 C++ 事实库路径。
+
+```bash
+build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 data/camera-ros-facts.sock data/ros-facts.db
+```
+
+收到第一条 Topic 消息后开始监测，每段连续静默只写一条事实。C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。后台模型调查期间仍可接收新观测。Worker 停着时，事实留在 C++ 库里，自动调查接收启动后的新观测。
 
 在隔离测试应用中暂停该 Topic 的发布。Worker 会自动派发调查，并在完成后输出运行记录。核心 API、应用启动入口和 Worker 共用同一个 `ROBOTOPS_DATA_DIR`。启动 `uv run robotops serve` 之后，可以按下表查回完整链路。
 
@@ -153,13 +181,12 @@ uv run --env-file .env robotops watch-ros-facts camera --port 8081 --max-model-c
 | `GET :8000/incidents/{id}` | 触发事实、自动任务状态和 `automatic_run_id` |
 | `GET :8000/runs/{run_id}` | 报告、运行状态或错误 |
 | `GET :8000/runs/{run_id}/evidence/{evidence_id}` | 报告引用的存证原文 |
-| `GET :8081/v1/event/{sequence}` | C++ 事实库中同一条原始观测 |
 
-自动调查默认最多调用模型六次。停发事实说明采集器在给定窗口内没有收到消息，根因需要结合其他现场证据研判。
+自动调查默认最多调用模型六次，最后一次用于提交报告。若收尾轮未提交有效报告，系统保存带已有证据引用的待人工研判结果。停发事实说明采集器在给定窗口内没有收到消息，根因需要结合其他现场证据研判。
 
 ## 使用模型调查
 
-启动示例服务后，在另一个终端执行。前几步仅在本地布置故障和创建事件，`/investigate` 会调用真实模型，一次调查可能包含多轮请求。
+启动示例服务后，在另一个终端执行。前几步仅在本地布置故障和创建事件，`/investigate` 会调用真实模型。默认每个 Agent 最多八次请求，最后一轮只允许提交报告或分支发现。
 
 ```bash
 # 启动数据生产与处理进程，并注册示例应用。
@@ -223,7 +250,7 @@ curl -sS -X POST "http://127.0.0.1:8000/incidents/${INCIDENT_ID}/investigate"
 ## 项目结构
 
 ```text
-cpp/ros1_facts/      # C++17 Topic 采集器、事实库和本机 HTTP
+cpp/ros1_facts/      # C++17 Topic 采集器、事实库和本机 Socket
 src/robotops/
   api.py           # 应用、事件、调查与回查接口
   runner.py        # 一条命令接入、前台输出与退出事件

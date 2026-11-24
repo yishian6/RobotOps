@@ -124,19 +124,7 @@ class RoleScope:
         """
         if name not in self.allowed:
             return {"status": "error", "error": "Tool is outside this agent's scope"}
-        if name == "read_evidence":
-            evidence_id = arguments.get("evidence_id")
-            if not isinstance(evidence_id, str) or evidence_id not in self.evidence_ids:
-                return {"status": "error", "error": "Evidence is outside this agent's scope"}
-        if name == "update_working_memory":
-            # 主 Agent 的记忆只纳入实际共享的分支引用，避免借记忆接口绕过证据视图。
-            try:
-                references = WorkingMemory.model_validate(arguments).references()
-            except ValidationError as exc:
-                return invalid_arguments("Invalid working memory arguments", exc)
-            if not references <= self.evidence_ids:
-                return {"status": "error", "error": "Memory cites evidence outside this agent's scope"}
-        result = self.gateway.execute(name, arguments)
+        result = self.gateway.execute(name, arguments, visible_evidence=self.evidence_ids)
         if result.get("evidence_id"):
             self.evidence_ids.add(result["evidence_id"])
         return result

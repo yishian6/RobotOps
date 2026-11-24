@@ -150,9 +150,13 @@ def _select_archive_view(
         # 原始参数留在轨迹，后续模型只需要纠错反馈。
         entry.pop("arguments")
         entry.update(view="optional_tool_error", result=data)
-    elif tool == "update_working_memory":
+    elif tool == "update_working_memory" and data.get("status") == "ok":
         # 当前记忆已随归档发送，历史记忆用版本号回查。
+        entry.pop("arguments")
         entry.update(view="memory_version_reference", version=data.get("version"))
+    elif tool == "search_logs" and data.get("view") == "previous_complete_log_scan":
+        entry.pop("arguments")
+        entry.update(view="duplicate_reference", raw_uri=data["raw_uri"])
     elif evidence_id in protected:
         entry.update(view="protected_raw", result=data)
     elif strategy == "rolling":
@@ -305,7 +309,7 @@ class ContextSnapshots:
                 None: 绑定运行并确认其存在，不修改数据库中的快照。
         """
         self.store, self.run_id = store, run_id
-        store.run(run_id)
+        store.run_incident_id(run_id)
 
     def save(self, messages, tools, memory, manifest):
         """
@@ -320,21 +324,41 @@ class ContextSnapshots:
             Returns:
                 int: 新快照在当前运行中的递增序号。
         """
-        body = canonical(
-            {"messages": messages, "tools": tools, "memory": memory, "manifest": manifest}
-        )
-        # 请求正文与哈希基于同一稳定编码；快照包含工具定义，便于复核当轮全部可见输入。
-        digest = hashlib.sha256(body.encode()).hexdigest()
+        full = {"messages": messages, "tools": tools, "memory": memory, "manifest": manifest}
+        digest = hashlib.sha256(canonical(full).encode()).hexdigest()
+        prefix = messages[:1] if messages and messages[0]["role"] == "system" else []
+        shared = canonical({"prefix": prefix, "tools": tools})
+        shared_id = hashlib.sha256(shared.encode()).hexdigest()
+        message_rows = [
+            (hashlib.sha256(encoded.encode()).hexdigest(), encoded)
+            for encoded in map(canonical, messages[len(prefix):])
+        ]
+        body = {
+            "message_ids": [key for key, _ in message_rows], "shared_input": shared_id,
+            "memory": memory, "manifest": manifest,
+        }
         with self.store.connection() as db:
             # MAX(sequence)+1 与 INSERT 必须在同一写事务里串行，否则两个保存请求可能分配相同序号。
             db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT OR IGNORE INTO context_inputs VALUES (?, ?)", (shared_id, shared),
+            )
+            db.executemany("INSERT OR IGNORE INTO context_messages VALUES (?, ?)", message_rows)
+            version = memory.get("version")
+            if version:
+                saved = db.execute(
+                    "SELECT body FROM memories WHERE run_id=? AND version=?", (self.run_id, version),
+                ).fetchone()
+                if saved is not None and canonical(json.loads(saved["body"])) == canonical(memory):
+                    body.pop("memory")
+                    body["memory_version"] = version
             sequence = db.execute(
                 "SELECT COALESCE(MAX(sequence), 0)+1 FROM context_snapshots WHERE run_id=?",
                 (self.run_id,),
             ).fetchone()[0]
             db.execute(
                 "INSERT INTO context_snapshots VALUES (?, ?, ?, ?)",
-                (self.run_id, sequence, body, digest),
+                (self.run_id, sequence, canonical(body), digest),
             )
         return sequence
 
@@ -353,11 +377,46 @@ class ContextSnapshots:
                 "SELECT body, sha256 FROM context_snapshots WHERE run_id=? AND sequence=?",
                 (self.run_id, sequence),
             ).fetchone()
-        if row is None:
-            raise KeyError("Context snapshot not found in this investigation")
-        if hashlib.sha256(row["body"].encode()).hexdigest() != row["sha256"]:
+            if row is None:
+                raise KeyError("Context snapshot not found in this investigation")
+            try:
+                serialized = row["body"]
+                body = json.loads(serialized)
+                if "shared_input" in body:
+                    shared = db.execute(
+                        "SELECT body FROM context_inputs WHERE sha256=?",
+                        (body.pop("shared_input"),),
+                    ).fetchone()
+                    if shared is None:
+                        raise ValueError("Missing shared context input")
+                    fixed = json.loads(shared["body"])
+                    if "message_ids" in body:
+                        ids = body.pop("message_ids")
+                        messages = {
+                            row["sha256"]: json.loads(row["body"])
+                            for row in db.execute(
+                                "SELECT sha256, body FROM context_messages "
+                                "WHERE sha256 IN (SELECT value FROM json_each(?))",
+                                (canonical(ids),),
+                            )
+                        }
+                        body["messages"] = [messages[key] for key in ids]
+                    if "memory_version" in body:
+                        stored = db.execute(
+                            "SELECT body FROM memories WHERE run_id=? AND version=?",
+                            (self.run_id, body.pop("memory_version")),
+                        ).fetchone()
+                        if stored is None:
+                            raise ValueError("Missing context memory version")
+                        body["memory"] = json.loads(stored["body"])
+                    body["messages"] = fixed["prefix"] + body["messages"]
+                    body["tools"] = fixed["tools"]
+                    serialized = canonical(body)
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError("Context snapshot integrity check failed") from exc
+        if hashlib.sha256(serialized.encode()).hexdigest() != row["sha256"]:
             raise ValueError("Context snapshot integrity check failed")
-        return {"sequence": sequence, "sha256": row["sha256"], **json.loads(row["body"])}
+        return {"sequence": sequence, "sha256": row["sha256"], **body}
 
     def list(self, *, include_roles: bool = False):
         """

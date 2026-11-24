@@ -42,7 +42,7 @@ class Observer:
         return {"components": {"processor": {
             "process": {"alive": self.alive, "pid": 101, "cpu_time_seconds": 0.5},
             "telemetry": {
-                "instance_id": "fixture", "processing_age_ms": 3200,
+                "instance_id": "fixture", "processing_age_ms": 3200, "processing_latency_ms": 0.01,
                 "processed_count": 2, "received_count": 3, "bound_port": 9000,
             },
         }}}
@@ -213,7 +213,9 @@ def test_default_single_keeps_raw_observations(tmp_path):
         assert process["view"] == metrics["view"] == "selected_fields"
         sampled = metrics["data"]["current"]["components"]["processor"]
         assert sampled["process"] == {"alive": True, "pid": 101}
-        assert sampled["telemetry"]["processing_age_ms"] == 3200
+        assert sampled["telemetry"]["in_flight_processing_age_ms"] == 3200
+        assert sampled["telemetry"]["last_completed_processing_latency_ms"] == 0.01
+        assert "processing_latency_ms" not in sampled["telemetry"]
         return submit_report([process["evidence_id"], metrics["evidence_id"]])
 
     with TestClient(create_app(Config(data_dir=tmp_path), complete=model, observer=Observer(True))) as client:
@@ -235,6 +237,8 @@ def test_default_single_keeps_raw_observations(tmp_path):
             component = raw.get("current", raw)["components"]["processor"]
             assert component["process"]["cpu_time_seconds"] == 0.5
             assert component["telemetry"]["bound_port"] == 9000
+            assert component["telemetry"]["processing_age_ms"] == 3200
+            assert component["telemetry"]["processing_latency_ms"] == 0.01
 
 
 @pytest.mark.parametrize("roles, leaked_reference", [
@@ -459,7 +463,8 @@ def test_real_validation_failures_stop_optional_retry(tmp_path, tool, final_resp
             return reply(call=("invalid", "submit_report", {"status": "proposed"}))
         return submit_report(references)
 
-    app = create_app(Config(data_dir=tmp_path), complete=model, observer=Observer(True))
+    config = Config(data_dir=tmp_path, prompt_version="v1" if mode == "single" else "v2")
+    app = create_app(config, complete=model, observer=Observer(True))
     with TestClient(app) as client:
         client.post("/applications", json={"app_id": "pipeline", "components": ["processor"]}).raise_for_status()
         incident = client.post("/incidents", json={"app_id": "pipeline", "symptom": "输出停滞"}).json()
