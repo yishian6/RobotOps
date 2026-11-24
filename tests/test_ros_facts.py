@@ -16,7 +16,7 @@ from robotops.agent.client import ModelError
 from robotops.agent.context import ContextSnapshots
 from robotops.config import Config
 from robotops.models import ApplicationContract
-from robotops.ros_facts import RosFact, investigate_fact, watch_facts
+from robotops.ros_facts import RosFact, investigate_fact, replay_facts, watch_facts
 from robotops.storage import Store
 
 
@@ -72,6 +72,46 @@ def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path, topic_fact
         )
     with pytest.raises(ValueError, match="Evidence integrity check failed"):
         store.read_evidence(run["id"], evidence_id)
+
+
+def test_worker_replays_missing_facts_and_pending_tasks_after_restart(tmp_path, topic_fact, monkeypatch):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    queued = store.ingest_ros_fact("camera", {**topic_fact, "sequence": 2})
+    fact_db = tmp_path / "ros-facts.db"
+    with closing(sqlite3.connect(fact_db)) as db, db:
+        db.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA application_id=1380930374;
+            CREATE TABLE source(slot INTEGER, id TEXT, app TEXT, topic TEXT);
+            CREATE TABLE topic_silences(
+                sequence INTEGER PRIMARY KEY, observed_at_ms INTEGER,
+                last_message_at_ms INTEGER, silent_ms INTEGER, threshold_ms INTEGER
+            );
+        """)
+        db.execute("INSERT INTO source VALUES(1, ?, ?, ?)", (
+            topic_fact["source_id"], topic_fact["app_id"], topic_fact["topic"],
+        ))
+        for sequence in (1, 2):
+            db.execute("INSERT INTO topic_silences VALUES(?, ?, ?, ?, ?)", (
+                sequence, topic_fact["observed_at_ms"], topic_fact["last_message_at_ms"],
+                topic_fact["silent_ms"], topic_fact["threshold_ms"],
+            ))
+
+    path = tmp_path / "facts.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as abandoned:
+        abandoned.bind(str(path))
+    assert path.is_socket()
+    monkeypatch.setattr("robotops.ros_facts.DeepSeekClient", ScriptedClient)
+    config = Config(data_dir=tmp_path)
+    assert watch_facts(config, "camera", path, once=True, max_model_calls=6) == 0
+    assert store.incident(queued)["automatic_task_state"] == "COMPLETED"
+    pending, = store.queued_ros_fact_incidents("camera")
+    assert store.incident(pending)["ros_fact"] == topic_fact
+    assert watch_facts(config, "camera", path, once=True, max_model_calls=6) == 0
+    assert store.incident(pending)["automatic_task_state"] == "COMPLETED"
+    assert replay_facts(store, "camera", fact_db) == 0
+    assert len(store.incidents()) == 2
 
 
 @pytest.mark.parametrize("limit, expected_calls, reason", [

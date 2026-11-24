@@ -118,6 +118,31 @@ def test_last_request_reserves_the_report(runtime, submits_report):
     ])
 
 
+def test_manual_investigation_stops_after_three_empty_log_checks(runtime):
+    store, _, incident = runtime
+    offered = []
+
+    class Observer:
+        app_id = "pipeline"
+
+        def search_logs(self, keyword, limit, since):
+            return {"rows": [], "truncated": False}
+
+    def complete(_messages, tools):
+        names = {tool["function"]["name"] for tool in tools}
+        offered.append(names)
+        if names == {"submit_report"}:
+            return assistant_call("search_logs", {}, "ignored-final")
+        return assistant_call("search_logs", {}, f"logs-{len(offered)}")
+
+    run = investigate(store, Observer(), incident["id"], complete, "test-model")
+    assert len(offered) == 4 and offered[-1] == {"submit_report"}
+    assert run["state"] == "COMPLETED" and run["report"]["status"] == "needs_human"
+    from robotops.agent.context import ContextSnapshots
+
+    assert ContextSnapshots(store, run["id"]).get(4)["manifest"]["report_only"] == "no_progress"
+
+
 def test_contract_boundary():
     """
         验证路径型标识、额外命令字段、重复组件和无支持假设报告均不通过 Schema。

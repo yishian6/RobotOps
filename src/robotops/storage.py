@@ -301,6 +301,15 @@ class Store:
                     "UPDATE incidents SET state='NEEDS_HUMAN' WHERE id=?", (row["incident_id"],),
                 )
 
+    def queued_ros_fact_incidents(self, app_id: str) -> list[str]:
+        """Find imported observations whose automatic investigations have not started."""
+        with self.connection() as db:
+            return [row[0] for row in db.execute(
+                "SELECT t.incident_id FROM ros_fact_tasks t JOIN incidents i ON i.id=t.incident_id "
+                "WHERE i.app_id=? AND i.state='OPEN' AND t.run_id IS NULL ORDER BY t.rowid",
+                (app_id,),
+            )]
+
     def register_service(self, request: ServiceRegistration, observation: ServiceObservation) -> dict:
         """
             为已有服务生成最小应用契约，并在同一事务保存服务登记和首份观测。
@@ -367,7 +376,7 @@ class Store:
         return result
 
     def record_service_observation(
-        self, app_id: str, observation: ServiceObservation, *, plan_recovery: bool = False,
+        self, app_id: str, observation: ServiceObservation,
     ) -> dict:
         """
             持久化读数，首次确认运行后的失败创建事件，持续异常续记原事件。
@@ -375,7 +384,6 @@ class Store:
             Args:
                 app_id: 服务登记生成的应用编号。
                 observation: 本次只读探测的结果，包含探测开始时间。
-                plan_recovery: 为本次确认的意外退出保存待授权重启记录。
 
             Returns:
                 dict: 当前状态、关联事件编号与本次是否创建事件。
@@ -409,7 +417,7 @@ class Store:
                 return {"state": state, "incident_id": None, "created": False}
 
             active = db.execute(
-                "SELECT e.incident_id, e.config_version FROM service_exits e "
+                "SELECT e.incident_id FROM service_exits e "
                 "JOIN incidents i ON i.id=e.incident_id "
                 "WHERE e.app_id=? AND i.state!='RESOLVED'",
                 (app_id,),
@@ -435,19 +443,6 @@ class Store:
                     "UPDATE service_exits SET latest_observation=?, latest_instance_id=?, "
                     "occurrences=occurrences+1 WHERE incident_id=?",
                     (sample, failed_instance, incident_id),
-                )
-            if plan_recovery and (active is None or active["config_version"] == row["config_version"]):
-                # 事件和动作在同一事务提交。重复读数保留第一份动作依据。
-                db.execute(
-                    "INSERT INTO recovery_actions "
-                    "(id, incident_id, kind, state, unit, scope, config_version, "
-                    "failed_instance_id, basis, created_at) "
-                    "VALUES (?, ?, 'restart_service', 'AWAITING_AUTHORIZATION', ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(incident_id) DO NOTHING",
-                    (
-                        f"act-{uuid4().hex}", incident_id, row["unit"], row["scope"],
-                        row["config_version"], failed_instance, sample, utc_now(),
-                    ),
                 )
             return {"state": state, "incident_id": incident_id, "created": created}
 

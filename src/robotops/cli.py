@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 from time import sleep
 
@@ -33,16 +34,13 @@ def main():
     )
     monitor = commands.add_parser("monitor", help="Poll registered systemd services without a model")
     monitor.add_argument("--once", action="store_true", help="Poll once and print the results")
-    monitor.add_argument(
-        "--plan-recovery-for", metavar="APP_ID",
-        help="Record restart candidates for the selected registered service",
-    )
     facts = commands.add_parser(
         "watch-ros-facts", help="Receive local ROS 1 facts and automatically investigate new faults",
     )
     facts.add_argument("app_id")
     facts.add_argument("--socket", type=Path, help="Path to the local Unix datagram socket")
-    facts.add_argument("--once", action="store_true", help="Investigate one new fact and exit")
+    facts.add_argument("--facts-db", type=Path, help="Read-only startup replay source")
+    facts.add_argument("--once", action="store_true", help="Investigate one pending or new fact and exit")
     facts.add_argument("--max-model-calls", type=int, default=6, help="Maximum calls per automatic run")
     run = commands.add_parser(
         "run", usage="robotops run [--restart-on-exit] APP_ID -- COMMAND [ARG ...]",
@@ -70,14 +68,9 @@ def main():
 
         config = Config.load()
         store, manager = Store(config.data_dir), SystemdServiceManager()
-        if args.plan_recovery_for is not None:
-            try:
-                store.services(args.plan_recovery_for)
-            except KeyError:
-                monitor.error("recovery planning requires a registered systemd application ID")
         try:
             while True:
-                results = poll_services(store, manager, plan_recovery_for=args.plan_recovery_for)
+                results = poll_services(store, manager)
                 if args.once:
                     print(json.dumps(results, ensure_ascii=False))
                     return
@@ -96,11 +89,11 @@ def main():
         try:
             return watch_facts(
                 Config.load(), args.app_id, args.socket, once=args.once,
-                max_model_calls=args.max_model_calls,
+                max_model_calls=args.max_model_calls, facts_db=args.facts_db,
             )
         except KeyboardInterrupt:
             return
-        except (KeyError, OSError) as exc:
+        except (KeyError, OSError, sqlite3.Error, ValueError) as exc:
             facts.error(str(exc))
     elif args.command == "run":
         from .runner import run_application

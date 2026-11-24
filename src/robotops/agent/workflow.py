@@ -9,10 +9,10 @@ from ..config import Config
 from ..models import DiagnosticReport
 from ..observations import ObservationSource
 from ..storage import Store
-from ..tools import ToolGateway, tool_definitions
+from ..tools import DIRECT_OBSERVATION_TOOLS, ToolGateway, tool_definitions
 from .client import ModelError
 from .context import ContextSnapshots, Strategy
-from .graph import DEFAULT_MAX_MODEL_CALLS, InvestigationGraph
+from .graph import DEFAULT_MAX_MODEL_CALLS, InvestigationGraph, ModelCallBudget
 from .memory import MemoryStore
 from .prompt_loader import InvestigationPrompt, investigation_messages, load_investigation_prompt
 from .supervision import RolePrompts, Supervision, load_role_prompts
@@ -111,6 +111,8 @@ def investigate(
     if mode == "supervised":
         role_prompts = role_prompts or load_role_prompts()
         report_instruction += "\n" + role_prompts.supervisor
+    if automatic:
+        report_instruction += "\n报告须引用触发调查的 Topic 观测。未观测到根因时如实列出缺少的现场信息。"
     prompt = prompt or load_investigation_prompt()
     run_id = store.start_run(incident_id, model_name, automatic=automatic)
 
@@ -120,6 +122,7 @@ def investigate(
         graph = InvestigationGraph(
             store=store, run_id=run_id, complete=complete, model_name=model_name,
             context_strategy=context_strategy, snapshots=ContextSnapshots(store, run_id),
+            budget=ModelCallBudget(max_model_calls),
         )
         incident, evidence_id = _with_trigger_evidence(store, run_id, incident)
         initial_evidence = (evidence_id,) if evidence_id is not None else ()
@@ -148,11 +151,14 @@ def investigate(
             visible_evidence = None
 
         # 初始任务已经携带契约。保留显式 v1 基线用于既有的对照运行。
+        omitted = set()
         if prompt.version != "investigation/v1":
-            omitted = {"get_application_contract"}
+            omitted.add("get_application_contract")
             if mode == "single" and max_model_calls <= DEFAULT_MAX_MODEL_CALLS:
                 omitted.add("update_working_memory")
-            tools = [tool for tool in tools if tool["function"]["name"] not in omitted]
+        if automatic and observer is None:
+            omitted.update(DIRECT_OBSERVATION_TOOLS)
+        tools = [tool for tool in tools if tool["function"]["name"] not in omitted]
         report = graph.run(
             messages, [*tools, report_tool], execute,
             partial(
@@ -161,7 +167,6 @@ def investigate(
             ),
             memory.current, {"agent_role": role, "investigation_mode": mode}, metadata,
             final_tool=SUBMIT_REPORT, initial_evidence_ids=initial_evidence,
-            max_model_calls=max_model_calls,
         )
         store.finish_run(run_id, report=report)
     except Exception as exc:

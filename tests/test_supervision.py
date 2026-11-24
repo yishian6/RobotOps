@@ -9,8 +9,11 @@ from time import monotonic, sleep
 import pytest
 from fastapi.testclient import TestClient
 
+from robotops.agent.workflow import investigate
 from robotops.api import create_app
 from robotops.config import Config
+from robotops.models import ApplicationContract, IncidentCreate
+from robotops.storage import Store
 
 
 class Observer:
@@ -106,6 +109,34 @@ def submit_report(references):
             "kind": "manual_review", "reason": "复核未验证部分", "evidence_ids": references,
         },
     }))
+
+
+def test_concurrent_branches_share_the_parent_budget(tmp_path):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="pipeline", components=["processor"]))
+    incident = store.create_incident(IncidentCreate(app_id="pipeline", symptom="输出停滞"))
+
+    def model(_messages, tools):
+        names = {tool["function"]["name"] for tool in tools}
+        if names == {"submit_report"}:
+            return submit_report([])
+        if "submit_finding" in names:
+            assert names == {"submit_finding"}
+            return reply(content={"status": "blocked", "summary": "待取证", "missing_observations": ["指标"]})
+        return reply(call=("dispatch", "dispatch_investigation", {"assignments": [
+            {"role": "application", "question": "读指标"},
+            {"role": "system", "question": "查进程"},
+        ]}))
+
+    run = investigate(
+        store, Observer(True), incident["id"], model, "fixture", mode="supervised", max_model_calls=3,
+    )
+    assert run["state"] == "COMPLETED"
+    events = store.trace(run["id"])
+    calls = [event["agent_role"] for event in events if event["type"] == "model"]
+    assert calls[0] == calls[-1] == "supervisor" and len(calls) == 3
+    assert calls[1] in {"application", "system"}
+    assert any(e.get("blocked_reason") == "model_call_budget" for e in events)
 
 
 def test_branch_deadline_releases_parent_and_keeps_missing_usage(tmp_path):
