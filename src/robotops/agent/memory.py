@@ -6,6 +6,7 @@ import json
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
+from pydantic_core import PydanticCustomError
 
 from ..models import Identifier, Model
 from ..storage import Store
@@ -30,7 +31,9 @@ class MemoryHypothesis(Model):
     """
 
     claim: str = Field(min_length=1, max_length=2000)
-    assessment: Literal["supported", "refuted", "unverified"] = "unverified"
+    assessment: Literal["supported", "refuted", "unverified"] = Field(
+        default="unverified", description="supported 需要 support_ids，refuted 需要 contradict_ids。"
+    )
     # 支持与反对引用分开保存，并共同进入保护集合，不能因结论倾向而丢掉另一侧。
     support_ids: list[EvidenceID] = Field(default_factory=list)
     contradict_ids: list[EvidenceID] = Field(default_factory=list)
@@ -47,9 +50,17 @@ class MemoryHypothesis(Model):
                 MemoryHypothesis: 校验通过的当前记忆假设实例。
         """
         if self.assessment == "supported" and not self.support_ids:
-            raise ValueError("Supported memory hypothesis requires support_ids")
+            raise PydanticCustomError(
+                "hypothesis_evidence_required",
+                "Supported hypotheses need support_ids. Use unverified if evidence is missing.",
+                {"field": "support_ids"},
+            )
         if self.assessment == "refuted" and not self.contradict_ids:
-            raise ValueError("Refuted memory hypothesis requires contradict_ids")
+            raise PydanticCustomError(
+                "hypothesis_evidence_required",
+                "Refuted hypotheses need contradict_ids. Use unverified if evidence is missing.",
+                {"field": "contradict_ids"},
+            )
         return self
 
 

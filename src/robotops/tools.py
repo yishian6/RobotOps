@@ -78,6 +78,7 @@ TOOL_SPECS = {
         "保存本次调查事实/假设/待查问题；支持和反对引用均保护原文。只修改调查记忆。",
     ),
 }
+DIRECT_OBSERVATION_TOOLS = {"inspect_process", "query_metrics", "search_logs", "get_recent_config_changes"}
 
 
 def tool_definitions(allowed: Collection[str] | None = None) -> list[dict]:
@@ -103,6 +104,32 @@ def tool_definitions(allowed: Collection[str] | None = None) -> list[dict]:
         for name, (schema, description) in TOOL_SPECS.items()
         if allowed is None or name in allowed
     ]
+
+
+def invalid_arguments(message: str, error: ValidationError, prefix: tuple = ()) -> dict:
+    """
+        给模型提供可修正的字段路径，不回显整份失败输入。
+
+        Args:
+            message: 工具使用的简短错误说明。
+            error: Pydantic 参数校验错误。
+            prefix: 嵌套校验所属的工具参数路径。
+
+        Returns:
+            dict: 工具错误及字段路径、错误类型和原因。
+    """
+    issues = []
+    for item in error.errors(include_input=False, include_url=False):
+        path = [*prefix, *item["loc"]]
+        kind = item["type"]
+        details = item["msg"]
+        if kind == "extra_forbidden" and path:
+            # 未声明的键也来自模型，避免把任意文本或整份参数回显到下一轮。
+            path[-1] = "<unexpected_field>"
+        if kind == "hypothesis_evidence_required":
+            path.append(item["ctx"]["field"])
+        issues.append({"path": path, "code": kind, "message": details})
+    return {"status": "error", "error": message, "validation_errors": issues}
 
 
 class ToolGateway:
@@ -150,6 +177,8 @@ class ToolGateway:
         try:
             args = TOOL_SPECS[name][0].model_validate(arguments)
         except ValidationError as exc:
+            if name == "update_working_memory":
+                return invalid_arguments("Invalid working memory arguments", exc)
             return {"status": "error", "error": "Invalid tool arguments", "details": str(exc)}
         # 原文回取沿用原证据身份，不生成新的观测时间或 ID，避免把旧结果包装成最新实测。
         if name == "read_evidence":
@@ -167,6 +196,11 @@ class ToolGateway:
         try:
             if name == "get_application_contract":
                 data = self.store.contract(self.incident["app_id"])
+            elif name == "search_logs" and "execution_exit" in self.incident:
+                # 事件绑定到失败的那次启动，后续重启的同名进程不会替换这份现场记录。
+                data = self.store.execution_logs(
+                    self.incident["id"], args.keyword, args.limit, args.since,
+                )
             elif name == "retrieve_cases":
                 try:
                     contract = self.store.contract(self.incident["app_id"])

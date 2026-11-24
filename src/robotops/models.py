@@ -5,11 +5,18 @@
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 # 限定 1–64 位 ASCII 标识：首位小写字母，后续仅字母/数字/下划线/短横线。
 # 首尾锚点禁止把路径片段混成应用/组件名；标识校验不能替代运行归属和动作授权。
 Identifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+# 一个确定的服务单元，可含模板实例和 systemd 的十六进制转义。禁止路径、通配符和选项。
+ServiceUnit = Annotated[
+    str, Field(
+        max_length=255,
+        pattern=r"^(?:[A-Za-z0-9_.:@]|\\x[0-9a-fA-F]{2})(?:[A-Za-z0-9_.:@-]|\\x[0-9a-fA-F]{2})*\.service$",
+    ),
+]
 
 
 def utc_now() -> str:
@@ -140,6 +147,33 @@ class IncidentCreate(Model):
     # 症状文本是调查输入，不能直接用作已确认根因或恢复成功的依据。
     symptom: str = Field(min_length=1, max_length=2000)
     source: Literal["manual", "detector"] = "manual"
+
+
+class ServiceRegistration(Model):
+    """
+        登记已有的长期运行服务。显示名选填，作用域决定要查询哪个 systemd 管理器。
+    """
+
+    unit: ServiceUnit
+    scope: Literal["system", "user"] = "system"
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class ServiceObservation(Model):
+    """
+        一次 systemd 状态读数。失败停机和无法观察分别表示，原始状态与时间一起保留。
+    """
+
+    observed_at: AwareDatetime
+    state: Literal["running", "stopped", "failed", "transitioning", "unknown"]
+    unit: ServiceUnit | None = None
+    active_state: str | None = None
+    sub_state: str | None = None
+    result: str | None = None
+    main_pid: int | None = Field(default=None, gt=0)
+    exec_main_status: int | None = Field(default=None, ge=0)
+    instance_id: str | None = None
+    detail: str | None = None
 
 
 class Hypothesis(Model):

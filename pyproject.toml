@@ -38,7 +38,6 @@ package-dir = {"robotops" = "src/robotops", "robotops.resources" = "config", "ro
     "prompts/investigation/*/*.txt",
     "prompts/investigation/*/manifest.json",
     "prompts/supervision/v1/roles.json",
-    "prompts/adaptive/*/roles.json",
 ]
 "robotops_examples.pipeline" = ["contract.json", "cases.json"]
 

@@ -2,29 +2,34 @@
     只读故障调查状态图；模型选择工具，后端校验报告及证据。
 """
 
-import hashlib
 import json
 import sys
-from typing import TypedDict
+from datetime import datetime, timezone
+from time import monotonic
+from typing import Literal, TypedDict, get_args
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
+from ..config import Config
 from ..models import DiagnosticReport
-from ..observations import ObservationSource
+from ..observations import ObservationSource, compact_model_observation
 from ..storage import Store
 from ..tools import ToolGateway, tool_definitions
-from .client import AssistantMessage, ModelError
-from .context import ContextSnapshots, Strategy, assemble, canonical
+from .client import AssistantMessage, DeepSeekClient, ModelError
+from .context import ContextSnapshots, Strategy, assemble
 from .memory import MemoryStore
-from .prompt_loader import InvestigationPrompt, investigation_messages
-from .supervision import (
-    INVESTIGATION_MODES,
-    SUBMIT_REPORT,
-    InvestigationMode,
-    RolePrompts,
-    Supervision,
-    load_role_prompts,
+from .prompt_loader import InvestigationPrompt, investigation_messages, load_investigation_prompt
+from .recovery import OPTIONAL_TOOLS, InvestigationRecovery
+from .supervision import RolePrompts, Supervision, load_role_prompts
+
+InvestigationMode = Literal["single", "supervised"]
+INVESTIGATION_MODES = get_args(InvestigationMode)
+DEFAULT_API_MODE: InvestigationMode = "single"
+SUBMIT_REPORT = "submit_report"
+_REPORT_INSTRUCTION = (
+    "先查能区分故障假设的现场观测。初始消息已有应用契约。历史案例和工作记忆按需使用。"
+    "能说明故障现象、范围和下一步时，单独通过 submit_report 提交，未证实的机制列为待查。"
 )
 
 
@@ -48,8 +53,11 @@ def investigate(
     model_name: str,
     prompt: InvestigationPrompt | None = None,
     context_strategy: Strategy = "evidence",
-    mode: InvestigationMode = "single",
+    mode: InvestigationMode = DEFAULT_API_MODE,
     role_prompts: RolePrompts | None = None,
+    *,
+    branch_timeout_seconds: float = Config.branch_timeout_seconds,
+    automatic: bool = False,
 ):
     """
         为已有事件创建一次只读调查，并返回最终的持久化运行记录。
@@ -69,8 +77,10 @@ def investigate(
             model_name (str): 本次使用的模型名称，只用于调用配置或运行审计，不用于推断诊断质量。
             prompt (InvestigationPrompt | None): 已加载并固定的 Prompt 快照；为 None 时读取默认版本。
             context_strategy (Strategy): 上下文装配策略，作用于每个独立 Agent 历史。
-            mode (InvestigationMode): 单 Agent 基线、M1 监督对照或主 Agent 按需委派。
+            mode (InvestigationMode): 单 Agent 调查或层级式调查。
             role_prompts (RolePrompts | None): 可复用服务启动时读取的角色指令快照。
+            branch_timeout_seconds: 一个子任务批次允许等待的时长，主 Agent 调查可继续。
+        automatic: 同事务领取与事件绑定的自动调查任务。
 
         Returns:
             dict: 已完成或失败的持久化运行记录；图内异常记录为 FAILED 后返回。
@@ -80,20 +90,12 @@ def investigate(
     # 先校验模式并读取资源，避免配置错误留下 RUNNING 记录。
     if mode not in INVESTIGATION_MODES:
         raise ValueError("Unknown investigation mode")
-    if mode != "single":
-        role_prompts = role_prompts or load_role_prompts()
-    messages, prompt_metadata = investigation_messages(
-        incident, contract, prompt,
-        report_tool_instruction=role_prompts.adaptive_supervisor if mode == "adaptive" else None,
-    )
+    report_instruction = _REPORT_INSTRUCTION
     if mode == "supervised":
-        messages[0]["content"] += "\n" + role_prompts.supervisor
-        prompt_metadata["messages_sha256"] = hashlib.sha256(canonical(messages).encode()).hexdigest()
-    run_id = store.start_run(incident_id, model_name)
-    # 工具、记忆和快照使用服务端生成的 run_id，角色范围在这个运行之内进一步收窄。
-    gateway = ToolGateway(store, observer, run_id)
-    memory_store = MemoryStore(store, run_id)
-    snapshots = ContextSnapshots(store, run_id)
+        role_prompts = role_prompts or load_role_prompts()
+        report_instruction += "\n" + role_prompts.supervisor
+    prompt = prompt or load_investigation_prompt()
+    run_id = store.start_run(incident_id, model_name, automatic=automatic)
 
     def validate_report(content: str, visible_evidence=None) -> dict:
         """
@@ -111,8 +113,11 @@ def investigate(
         except ValidationError as exc:
             raise ModelError("Model final report does not match the diagnostic schema") from exc
         available = store.evidence_ids(run_id) if visible_evidence is None else visible_evidence
-        if not validated.referenced_evidence() <= available:
+        references = validated.referenced_evidence()
+        if not references <= available:
             raise ModelError("Model cited evidence outside this investigation")
+        if trigger_evidence_id is not None and trigger_evidence_id not in references:
+            raise ModelError("The report must cite the original ROS Topic observation")
         # 历史案例、应用契约和缺测不能单独证明一个当前根因。
         for hypothesis in validated.hypotheses:
             if hypothesis.assessment == "unverified":
@@ -129,7 +134,10 @@ def investigate(
             raise ModelError("Model suggested a target outside the application contract")
         return validated.model_dump(mode="json")
 
-    def run_graph(messages, tools, execute, finalize, memory_snapshot, tags, metadata, *, final_tool=None):
+    def run_graph(
+        messages, tools, execute, finalize, memory_snapshot, tags, metadata, *,
+        final_tool: str, deadline: float | None = None,
+    ):
         """
             在独立的 LangGraph 状态中运行一位 Agent，复用相同的请求与工具协议。
 
@@ -141,12 +149,28 @@ def investigate(
                 memory_snapshot: 提供当前角色工作记忆的回调。
                 tags: 模型请求与工具轨迹的角色/任务归属。
                 metadata: 当前使用的 Prompt 版本与指纹。
-                final_tool: 可选的结构化提交工具，参数通过 finalize 后可直接结束图。
+                final_tool: 结构化提交工具，参数通过 finalize 后可直接结束图。
+                deadline: 子任务批次单调时钟截止时间；主 Agent 不受此截止时间影响。
 
             Returns:
                 dict: 校验通过的报告或领域发现。
         """
         invalid_submissions = set()
+        recovery = InvestigationRecovery() if deadline is None else None
+
+        def remaining_time() -> float | None:
+            """
+                检查本轮是否还能继续，阻止已超时的分支发出新的模型调用或工具请求。
+
+                Returns:
+                    float | None: 子任务剩余秒数，主 Agent 返回 None。
+            """
+            if deadline is None:
+                return None
+            seconds = deadline - monotonic()
+            if seconds <= 0:
+                raise ModelError("Branch deadline elapsed")
+            return seconds
 
         def call_model(state):
             """
@@ -159,17 +183,30 @@ def investigate(
                     dict: 新的完整规范消息历史，以及最终报告字典或 None。
             """
             # 每轮读取最新记忆装配发送视图；state 仍保存规范历史，压缩不会覆盖审计原文。
+            remaining_time()
             memory = memory_snapshot()
             outgoing, manifest = assemble(state["messages"], memory, context_strategy)
+            available = tools
+            report_only = recovery is not None and recovery.failed_tool is not None
+            if report_only:
+                # 每份结果仍留在本轮上下文。收尾请求只暴露报告工具，避免再进入可选步骤。
+                available = [tool for tool in available if tool["function"]["name"] == final_tool]
+                manifest["report_only"] = recovery.failed_tool
             # 保存实际输入再请求；网络失败也有对应快照。规范历史始终另外保留。
-            sequence = snapshots.save(outgoing, tools, memory, {**manifest, **tags})
+            sequence = snapshots.save(outgoing, available, memory, {**manifest, **tags})
             try:
-                reply = complete(outgoing, tools)
+                remaining = remaining_time()
+                if remaining is not None and isinstance(getattr(complete, "__self__", None), DeepSeekClient):
+                    reply = complete(outgoing, available, timeout_seconds=remaining)
+                else:
+                    reply = complete(outgoing, available)
             except ModelError as exc:
                 store.trace(run_id, {
                     "type": "model_error", **tags, "context_sequence": sequence,
                     "usage": exc.usage, "error": str(exc),
                 })
+                if report_only:
+                    return {"messages": state["messages"], "report": recovery.fallback_report()}
                 raise
             # 无效响应也可能产生费用，但不能为记录用量而把未经筛选的响应正文写进轨迹。
             event = {
@@ -184,10 +221,14 @@ def investigate(
                 message = AssistantMessage.model_validate(reply["message"]).model_dump(
                     exclude_none=True
                 )
-            except ValidationError as exc:
+            except (KeyError, ValidationError) as exc:
                 store.trace(run_id, {**event, "message": None, "invalid_message": True})
+                if report_only:
+                    return {"messages": state["messages"], "report": recovery.fallback_report()}
                 raise ModelError("Invalid model tool-call message") from exc
             store.trace(run_id, {**event, "message": message})
+            # 迟到的模型响应仍记用量，但不能推进图或发布发现。
+            remaining_time()
             calls = message.get("tool_calls") or []
             if message.get("role") != "assistant" or not isinstance(calls, list):
                 raise ModelError("Invalid model message")
@@ -195,8 +236,19 @@ def investigate(
             # 工具结果依靠调用 ID 配对；同轮或跨轮重复都会让历史含义变得不明确。
             past_ids = {call["id"] for item in state["messages"] for call in item.get("tool_calls", [])}
             if len(set(ids)) != len(ids) or set(ids) & past_ids:
+                if report_only:
+                    return {"messages": state["messages"], "report": recovery.fallback_report()}
                 raise ModelError("Duplicate tool call IDs")
-            report = finalize(message.get("content") or "") if not calls else None
+            report = None
+            if not calls:
+                try:
+                    report = finalize(message.get("content") or "")
+                except ModelError:
+                    if not report_only:
+                        raise
+                    report = recovery.fallback_report()
+            elif report_only and (len(calls) != 1 or calls[0]["function"]["name"] != final_tool):
+                report = recovery.fallback_report()
             return {"messages": [*state["messages"], message], "report": report}
 
         def run_tools(state):
@@ -217,7 +269,9 @@ def investigate(
             messages = list(state["messages"])
             calls = messages[-1]["tool_calls"]
             report = None
+            report_only = recovery is not None and recovery.failed_tool is not None
             for call in calls:
+                remaining_time()
                 if call.get("type") != "function":
                     raise ModelError("Unsupported tool call type")
                 name = call["function"]["name"]
@@ -239,14 +293,25 @@ def investigate(
                         except ModelError as exc:
                             # 校验失败仍走工具协议，让领域 Agent 修正字段或引用，无需重跑已完成取证。
                             submission = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
-                            if submission in invalid_submissions:
+                            if submission in invalid_submissions and not report_only:
                                 raise ModelError("Repeated invalid structured submission") from exc
                             invalid_submissions.add(submission)
                             result = {"status": "error", "error": str(exc)}
                         else:
                             result = {"status": "ok"}
+                elif recovery is not None and recovery.failed_tool and name in OPTIONAL_TOOLS:
+                    result = {
+                        "status": "blocked",
+                        "reason": "Finish the report with available evidence before requesting more optional work.",
+                    }
                 else:
-                    result = execute(name, arguments)
+                    # 网关先保存原始证据，只精简发给 Agent 的常规观测视图。
+                    result = compact_model_observation(name, execute(name, arguments))
+                if recovery is not None:
+                    was_closing = recovery.failed_tool is not None
+                    result = recovery.record(name, result)
+                    if not was_closing and recovery.failed_tool:
+                        store.trace(run_id, {"type": "report_only", **tags, "tool": name})
                 store.trace(
                     run_id, {"type": "tool", **tags, "tool": name, "arguments": arguments, "result": result}
                 )
@@ -258,6 +323,8 @@ def investigate(
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
+            if report_only and report is None:
+                report = recovery.fallback_report()
             return {"messages": messages, "report": report}
 
         # START → model → tools → model；模型不再请求工具时校验最终报告并结束。
@@ -267,25 +334,64 @@ def investigate(
         graph.add_edge(START, "model")
         graph.add_conditional_edges(
             "model",
-            lambda state: "tools" if state["messages"][-1].get("tool_calls") else END,
+            lambda state: "tools" if not state["report"] and state["messages"][-1].get("tool_calls") else END,
         )
         graph.add_conditional_edges("tools", lambda state: END if state["report"] else "model")
 
         store.trace(
-            run_id, {"type": "prompt", **tags, **metadata, "messages": messages, "tools": tools}
+            run_id, {
+                "type": "prompt", **tags, **metadata, "messages": messages,
+                "tools": tools,
+            }
         )
         # 调查不以框架默认 25 步作为总调用额度；相同任务无新线索时由调查逻辑终止。
         result = graph.compile().invoke(
             {"messages": messages, "report": None}, {"recursion_limit": sys.maxsize}
         )
+        remaining_time()
         return result["report"]
 
     try:
-        if mode != "single":
-            supervision = Supervision(gateway, incident, contract, role_prompts, run_graph, mode=mode)
+        # 工具、记忆和快照使用服务端生成的 run_id，角色范围在这个运行之内进一步收窄。
+        gateway = ToolGateway(store, observer, run_id)
+        memory_store = MemoryStore(store, run_id)
+        snapshots = ContextSnapshots(store, run_id)
+        trigger_evidence_id = None
+        if (fact := incident.get("ros_fact")) is not None:
+            observed_at = datetime.fromtimestamp(
+                fact["observed_at_ms"] / 1000, timezone.utc,
+            ).isoformat()
+            trigger_evidence_id = store.save_evidence(run_id, "ros1_topic_observation", {
+                "status": "ok", "observed_at": observed_at, "data": fact,
+            })
+            incident = {
+                **incident, "ros_fact": {**fact, "evidence_id": trigger_evidence_id},
+                "investigation_goal": (
+                    "用现场证据说明 Topic 静默和可能影响。该记录仅证明采集端在给定窗口内"
+                    "未收到消息，根因依据不足时保留待查。"
+                ),
+            }
+        messages, prompt_metadata = investigation_messages(
+            incident, contract, prompt, report_tool_instruction=report_instruction,
+        )
+        report_tool = {
+            "type": "function",
+            "function": {
+                "name": SUBMIT_REPORT,
+                "description": "提交诊断报告，只引用本次调查可见的现场证据。",
+                "parameters": DiagnosticReport.model_json_schema(),
+            },
+        }
+        if mode == "supervised":
+            supervision = Supervision(
+                gateway, incident, contract, role_prompts, run_graph,
+                branch_timeout_seconds=branch_timeout_seconds,
+            )
+            if trigger_evidence_id is not None:
+                supervision.main.evidence_ids.add(trigger_evidence_id)
             report = run_graph(
                 messages,
-                supervision.tools,
+                [*supervision.tools, report_tool],
                 supervision.execute,
                 lambda content: validate_report(content, supervision.main.evidence_ids),
                 memory_store.current,
@@ -295,8 +401,9 @@ def investigate(
             )
         else:
             report = run_graph(
-                messages, tool_definitions(), gateway.execute, validate_report,
+                messages, [*tool_definitions(), report_tool], gateway.execute, validate_report,
                 memory_store.current, {"agent_role": "single", "investigation_mode": mode}, prompt_metadata,
+                final_tool=SUBMIT_REPORT,
             )
         store.finish_run(run_id, report=report)
     except Exception as exc:

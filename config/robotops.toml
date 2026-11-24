@@ -4,6 +4,10 @@ data_dir = "../data"
 model = "deepseek-flash"
 model_base_url = "https://api.deepseek.com"
 model_timeout_seconds = 60
+# 主 Agent 最多等这批子任务多少秒。到期后按缺测返回，主调查可继续。
+branch_timeout_seconds = 120
+# monitor 的轮询间隔，单位秒。单个服务状态读取超时由服务适配器单独处理。
+monitor_interval_seconds = 5
 # 默认直连；仅在确实需要继承系统代理/证书环境时改为 true。
 model_trust_env = false
 prompts_dir = "prompts"

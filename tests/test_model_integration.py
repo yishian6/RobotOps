@@ -2,6 +2,7 @@
     真实接入问题的离线回归：使用官方 ChatDeepSeek、SDK 和 LangGraph，不访问供应商网络。
 """
 
+import asyncio
 import json
 
 import httpx
@@ -13,6 +14,39 @@ from robotops.agent.workflow import investigate
 from robotops.config import Config
 from robotops.models import ApplicationContract, IncidentCreate
 from robotops.storage import Store
+
+
+def test_model_branch_deadline_cancels_in_flight_request():
+    """
+        验证官方 SDK 的异步请求尊重整个分支剩余时间，且超时后关闭传输。
+
+        Returns:
+            None: 传输替身收到取消，超时没有伪造用量。
+    """
+    cancelled = []
+
+    async def receive(_request):
+        """
+            模拟供应商长时间没有返回，记录本地请求是否被取消。
+
+            Args:
+                _request: SDK 构造的请求，测试无需读取其内容。
+
+            Returns:
+                httpx.Response: 模拟正常等待结束后的响应，测试中不会等到。
+        """
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return httpx.Response(500)
+
+    model = DeepSeekClient(Config(api_key="fixture"), transport=httpx.MockTransport(receive))
+    with pytest.raises(ModelError, match="branch deadline") as error:
+        model.complete([{"role": "user", "content": "fixture"}], [], timeout_seconds=0.5)
+    assert cancelled == [True]
+    assert error.value.usage == {}
 
 
 @pytest.mark.parametrize("arguments", ["{}", "not-json", '{"shell":"disallowed"}'])

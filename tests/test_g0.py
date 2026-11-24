@@ -251,7 +251,8 @@ def test_langgraph_executes_real_tools_and_persists_trace(runtime):
     ).hexdigest()
     assert snapshot["messages_sha256"] == actual_hash
     assert snapshot["messages"][0]["role"] == "system"
-    assert snapshot["tools"] == tool_definitions()
+    assert snapshot["tools"][:-1] == tool_definitions()
+    assert snapshot["tools"][-1]["function"]["name"] == "submit_report"
     assert trace[1]["usage"]["prompt_tokens"] == 10
 
 

@@ -4,6 +4,7 @@
 
 import json
 from threading import Barrier, Event
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
@@ -107,198 +108,133 @@ def submit_report(references):
     }))
 
 
-@pytest.mark.parametrize("confirm_exit", [False, True])
-def test_adaptive_default_keeps_basic_queries_in_one_agent(tmp_path, confirm_exit):
+def test_branch_deadline_releases_parent_and_keeps_missing_usage(tmp_path):
     """
-        验证不带 mode 的 API 直接取证，已有退出证据时跳过重复委派。
+        验证单分支阻塞时主调查可完成，迟到回复只用于用量审计。
 
         Args:
-            tmp_path: 独立运行目录。
-            confirm_exit: 是否尝试重复确认主 Agent 已查到的退出事实。
+            tmp_path: 独立的调查数据目录。
 
         Returns:
-            None: 核对实际请求数、工具和端到端证据引用。
+            None: 同一任务只有一个 blocked 终态，且没有迟到的工具调用。
+    """
+    release = Event()
+    started = Event()
+
+    def complete(messages, _tools):
+        """
+            用事件模拟一轮不会在分支截止时间内返回的模型请求。
+
+            Args:
+                messages: 主 Agent 或系统分支的实际消息。
+                _tools: 角色可用的工具。
+
+            Returns:
+                dict: 固定的工具调用，单分支在测试释放后才响应。
+        """
+        assignment = json.loads(messages[1]["content"]).get("assignment")
+        if assignment:
+            started.set()
+            if not release.wait(6):
+                raise AssertionError("Parent investigation did not return")
+            return reply(call=("late_tool", "inspect_process", {}))
+        last = messages[-1]
+        if last["role"] != "tool":
+            return reply(call=("delegate", "dispatch_investigation", {
+                "assignments": [{"role": "system", "question": "读取进程资源快照"}],
+            }))
+        body = json.loads(last["content"])
+        assert started.is_set()
+        assert not release.is_set()
+        assert body["findings"][0]["status"] == "blocked"
+        assert body["findings"][0]["blocked_reason"] == "deadline_exceeded"
+        return submit_report([])
+
+    config = Config(data_dir=tmp_path, branch_timeout_seconds=0.8)
+    with TestClient(create_app(config, complete=complete, observer=Observer(True))) as client:
+        client.post("/applications", json={"app_id": "pipeline", "components": ["processor"]}).raise_for_status()
+        incident = client.post("/incidents", json={"app_id": "pipeline", "symptom": "调查资源情况"}).json()
+        try:
+            run = client.post(f"/incidents/{incident['id']}/investigate", params={"mode": "supervised"}).json()
+            assert run["state"] == "COMPLETED", run
+            base = f"/runs/{run['id']}"
+            usage = client.get(f"{base}/usage").json()
+            assert usage["by_role"]["supervisor"]["recorded_attempts"] == 2
+            system = usage["by_role"]["system"]
+            assert system["context_requests"] == system["unreported_attempts"] == 1
+            assert system["reported_cache_tokens"]["prompt_cache_hit_tokens"] is None
+        finally:
+            release.set()
+        poll_until = monotonic() + 2
+        while monotonic() < poll_until:
+            usage = client.get(f"{base}/usage").json()
+            if usage["by_role"]["system"]["recorded_attempts"]:
+                break
+            sleep(0.01)
+        assert usage["by_role"]["system"]["reported_tokens"]["prompt_tokens"] == 8
+        trace = client.get(f"{base}/trace").json()
+        assert [row["status"] for row in trace if row["type"] == "branch_finished"] == ["blocked"]
+        assert not any(row["type"] == "tool" and row["agent_role"] == "system" for row in trace)
+
+
+def test_default_single_keeps_raw_observations(tmp_path):
+    """
+        核对默认单 Agent 取证、结构化交卷、模式列表和原始证据。
+
+        Args:
+            tmp_path: 本次调查独立的数据目录。
+
+        Returns:
+            None: 模型直查后两轮交卷，原始证据仍能按引用回取。
     """
     def model(messages, tools):
         """
-            同轮提出基础检查，随后交卷或请求一次冗余委派以验证后端分支门槛。
+            在同一轮请求进程和指标，取得结果后直接交报告。
 
             Args:
-                messages: 当前主 Agent 发送上下文。
-                tools: 当前已绑定的工具定义。
+                messages: 当轮模型输入。
+                tools: 当前可调用工具。
 
             Returns:
-                dict: 本轮模型响应。
+                dict: 两项观测调用或最终报告。
         """
         names = {tool["function"]["name"] for tool in tools}
-        assert {"inspect_process", "query_metrics", "dispatch_investigation", "submit_report"} <= names
+        assert {"inspect_process", "query_metrics", "submit_report"} <= names
+        assert "dispatch_investigation" not in names
         if messages[-1]["role"] != "tool":
-            # 报告 Schema 只通过 submit_report 下发，系统指令不再重复整份定义。
+            # 报告 Schema 已由 submit_report 提供，主提示词无需再发送一次。
             assert '"title": "DiagnosticReport"' not in messages[0]["content"]
-            result = reply(call=("process", "inspect_process", {}))
-            result["message"]["tool_calls"] += reply(
+            response = reply(call=("process", "inspect_process", {}))
+            response["message"]["tool_calls"] += reply(
                 call=("metrics", "query_metrics", {})
             )["message"]["tool_calls"]
-            return result
-        body = json.loads(messages[-1]["content"])
-        if body.get("status") == "skipped":
-            assert body["confirmed_exit"]["component"] == "processor"
-            return submit_report([body["confirmed_exit"]["evidence_id"]])
+            return response
         process, metrics = [json.loads(message["content"]) for message in messages[-2:]]
         assert process["view"] == metrics["view"] == "selected_fields"
-        assert process["data"]["components"]["processor"]["telemetry"] == {"instance_id": "fixture"}
         sampled = metrics["data"]["current"]["components"]["processor"]
-        assert sampled["process"] == {"alive": not confirm_exit, "pid": 101}
+        assert sampled["process"] == {"alive": True, "pid": 101}
         assert sampled["telemetry"]["processing_age_ms"] == 3200
-        refs = [process["evidence_id"], metrics["evidence_id"]]
-        if confirm_exit:
-            return reply(call=("unneeded", "dispatch_investigation", {
-                "assignments": [{
-                    "role": "system", "question": "确认处理进程退出了吗",
-                    "reason": "测试重复确认", "expected_observation": "进程状态", "evidence_ids": refs,
-                    "probe": {"tool": "inspect_process"},
-                }],
-                "confirm_exit_of": "processor",
-            }))
-        return submit_report(refs)
+        return submit_report([process["evidence_id"], metrics["evidence_id"]])
 
-    with TestClient(create_app(Config(data_dir=tmp_path), complete=model, observer=Observer(not confirm_exit))) as client:
+    with TestClient(create_app(Config(data_dir=tmp_path), complete=model, observer=Observer(True))) as client:
+        health = client.get("/health").json()
+        assert health["default_investigation_mode"] == "single"
+        assert health["investigation_modes"] == ["single", "supervised"]
         client.post("/applications", json={"app_id": "pipeline", "components": ["processor"]}).raise_for_status()
         incident = client.post("/incidents", json={"app_id": "pipeline", "symptom": "检查处理输出"}).json()
-        assert client.get("/health").json()["default_investigation_mode"] == "adaptive"
-        run = client.post(f"/incidents/{incident['id']}/investigate").json()
+        endpoint = f"/incidents/{incident['id']}/investigate"
+        assert client.post(endpoint, params={"mode": "adaptive"}).status_code == 422
+        run = client.post(endpoint).json()
         assert run["state"] == "COMPLETED", run
         trace = client.get(f"/runs/{run['id']}/trace").json()
-        assert not any(row["type"] == "dispatch_started" for row in trace)
+        assert not any(row["type"] == "branch_started" for row in trace)
         calls = [row for row in trace if row["type"] == "model"]
-        assert len(calls) == 2 + confirm_exit
-        assert all(row["investigation_mode"] == "adaptive" for row in calls)
-        assert len(calls[0]["message"]["tool_calls"]) == 2
+        assert [row["agent_role"] for row in calls] == ["single", "single"]
         for evidence_id in run["report"]["recommended_action"]["evidence_ids"]:
-            current = client.get(f"/runs/{run['id']}/evidence/{evidence_id}").json()
-            assert current["raw"]["status"] == "ok"
-            raw = current["raw"]["data"]
+            raw = client.get(f"/runs/{run['id']}/evidence/{evidence_id}").json()["raw"]["data"]
             component = raw.get("current", raw)["components"]["processor"]
             assert component["process"]["cpu_time_seconds"] == 0.5
             assert component["telemetry"]["bound_port"] == 9000
-
-
-@pytest.mark.parametrize("roles, mixed_batch", [
-    (("application",), False), (("application", "system"), False), (("system",), True),
-])
-def test_adaptive_dispatches_after_observing_and_shares_evidence(tmp_path, roles, mixed_batch):
-    """
-        验证初查前拒绝分派，初查后按问题启动一个或两个分支并复用原有证据。
-
-        Args:
-            tmp_path: 独立运行目录。
-            roles: 该场景需要委派的领域。
-            mixed_batch: 是否在重复的应用检查同批加入尚未执行的系统检查。
-
-        Returns:
-            None: 核对分支数量、并行、证据访问及分派理由审计。
-    """
-    barrier = Barrier(2) if len(roles) == 2 else None
-    collected = []
-
-    def model(messages, tools):
-        """
-            驱动主 Agent 初查和两个独立角色的实际工具流程。
-
-            Args:
-                messages: 当前角色发送上下文。
-                tools: 当前角色已绑定的工具定义。
-
-            Returns:
-                dict: 工具调用或最终发现。
-        """
-        task = json.loads(messages[1]["content"]).get("assignment")
-        body = json.loads(messages[-1]["content"]) if messages[-1]["role"] == "tool" else None
-        names = {tool["function"]["name"] for tool in tools}
-        if task is None:
-            if body is None:
-                return reply(call=("early", "dispatch_investigation", {"assignments": []}))
-            if body["status"] == "error":
-                assert "before delegation" in body["error"]
-                return reply(call=("triage", "query_metrics", {}))
-            if body["status"] == "ok" and "findings" not in body:
-                # 同样的指标检查即使改写任务描述、显式填写默认值，也不该再次开分支。
-                assignments = [{
-                    "role": "application", "question": "重新核实生产与消费速率",
-                    "reason": "同样的检查", "expected_observation": "原速率",
-                    "evidence_ids": [body["evidence_id"]],
-                    "probe": {"tool": "query_metrics", "arguments": {"sample_seconds": 0.3}},
-                }]
-                if mixed_batch:
-                    assignments.append({
-                        "role": "system", "question": "核对进程存活", "reason": "基础速率不足以判断",
-                        "expected_observation": "当前进程信息", "evidence_ids": [body["evidence_id"]],
-                        "probe": {"tool": "inspect_process"},
-                    })
-                return reply(call=("duplicate", "dispatch_investigation", {"assignments": assignments}))
-            if "findings" not in body:
-                assert body["status"] == "skipped"
-                if collected:
-                    return submit_report(collected)
-                evidence_id = body["skipped"][0]["evidence_id"]
-                assert evidence_id
-                return reply(call=("delegate", "dispatch_investigation", {"assignments": [
-                    {
-                        "role": role, "question": f"核对 {role} 的未解现象", "reason": "基础速率不足以判断",
-                        "expected_observation": f"补查 {role} 证据", "evidence_ids": [evidence_id],
-                        "probe": {"tool": "query_metrics", "arguments": {"sample_seconds": 1}}
-                        if role == "application" else {"tool": "inspect_process"},
-                    } for role in roles
-                ]}))
-            collected.extend(ref for finding in body["findings"] for ref in finding["support_ids"])
-            if mixed_batch:
-                assert [item["role"] for item in body["skipped"]] == ["application"]
-                assert body["skipped"][0]["evidence_id"]
-            # 已委派过的检查换成新问题与新引用，仍是同一次读数请求。
-            return reply(call=("rephrase", "dispatch_investigation", {"assignments": [{
-                "role": roles[0], "question": "换个问题复查同一项观测",
-                "reason": "复述刚派的观察", "expected_observation": "同一次检查的数据",
-                "evidence_ids": collected,
-                "probe": {"tool": "inspect_process"} if mixed_batch else {
-                    "tool": "query_metrics", "arguments": {"sample_seconds": 1.0},
-                },
-            }]}))
-
-        assert "dispatch_investigation" not in names
-        role = task["role"]
-        assert len(task["evidence_ids"]) == 1
-        if body is None:
-            if barrier:
-                # 两位领域 Agent 首轮一起进入，才能通过同步点。
-                barrier.wait(timeout=5)
-            return reply(call=("shared", "read_evidence", {"evidence_id": task["evidence_ids"][0]}))
-        if "raw" in body:
-            assert body["status"] == "ok" and body["tool"] == "query_metrics"
-            if role == "application":
-                return reply(call=("old-only", "submit_finding", {
-                    "status": "complete", "summary": "只有旧实测", "support_ids": [body["id"]],
-                }))
-            return reply(call=("process", "inspect_process", {}))
-        if body["status"] == "error":
-            assert "newly collected probe" in body["error"]
-            return reply(call=("sample", "query_metrics", {"sample_seconds": 1}))
-        return reply(call=("finding", "submit_finding", {
-            "status": "complete", "summary": "补充已核验事实", "support_ids": [body["evidence_id"]],
-        }))
-
-    with TestClient(create_app(Config(data_dir=tmp_path), complete=model, observer=Observer(True))) as client:
-        client.post("/applications", json={"app_id": "pipeline", "components": ["processor"]}).raise_for_status()
-        incident = client.post("/incidents", json={"app_id": "pipeline", "symptom": "检查处理输出"}).json()
-        run = client.post(f"/incidents/{incident['id']}/investigate").json()
-        assert run["state"] == "COMPLETED", run
-        trace = client.get(f"/runs/{run['id']}/trace").json()
-        started = [row for row in trace if row["type"] == "branch_started"]
-        assert {row["agent_role"] for row in started} == set(roles)
-        assert all(row["assignment"]["reason"] == "基础速率不足以判断" for row in started)
-        dispatches = [row for row in trace if row.get("tool") == "dispatch_investigation"]
-        statuses = ["error", "ok", "skipped"] if mixed_batch else ["error", "skipped", "ok", "skipped"]
-        assert [row["result"]["status"] for row in dispatches] == statuses
-        assert {row["status"] for row in trace if row["type"] == "branch_finished"} == {"complete"}
 
 
 @pytest.mark.parametrize("roles, leaked_reference", [
@@ -377,7 +313,7 @@ def test_supervised_api_roles_evidence_and_trace(tmp_path, roles, leaked_referen
             return reply(call=("observe", tool, {}))
         if role == "application":
             if body["status"] == "error":
-                assert "requires successful domain observation" in body["error"]
+                assert "requires newly collected domain observation" in body["error"]
                 return reply(call=("finding-fixed", "submit_finding", {
                     "status": "complete", "summary": "已核对当前输出", "support_ids": [application_reference],
                 }))
@@ -434,3 +370,112 @@ def test_supervised_api_roles_evidence_and_trace(tmp_path, roles, leaked_referen
                 snap = client.get(f"{base}/contexts/{row['context_sequence']}").json()
                 assert snap["manifest"]["agent_role"] == row["agent_role"]
                 assert snap["manifest"].get("task_id") == row.get("task_id")
+
+
+@pytest.mark.parametrize(("tool", "final_response"), [
+    ("update_working_memory", "report"),
+    ("update_working_memory", "repair"),
+    ("dispatch_investigation", "unavailable_tool"),
+    ("update_working_memory", "invalid_report"),
+])
+def test_real_validation_failures_stop_optional_retry(tmp_path, tool, final_response):
+    """
+        离线验证缺反证引用和不完整委派能够按字段纠错并收尾。
+
+        Args:
+            tmp_path: 独立的调查数据目录。
+            tool: 模型尝试调用的可选工具。
+            final_response: 修正后继续、正常收尾或无法交付有效报告的情况。
+
+        Returns:
+            None: 字段路径明确，重复同类问题后只再请求一次报告。
+    """
+    mode = "supervised" if tool == "dispatch_investigation" else "single"
+    references = []
+
+    def rejected_arguments(attempt):
+        """
+            构造措辞或列表下标有变化的同类错误。
+
+            Args:
+                attempt: 当前错误出现的次数。
+
+            Returns:
+                dict: 可重现已观测到的真实参数缺陷。
+        """
+        if tool == "update_working_memory":
+            hypotheses = [{"claim": f"检查 {attempt} 的工作假设", "assessment": "refuted"}]
+            if attempt == 2:
+                hypotheses.insert(0, {"claim": "仍缺证的另一项假设"})
+            return {"hypotheses": hypotheses}
+        return {"assignments": [{
+            "role": "system", "evidence_ids": [],
+        }]}
+
+    def model(messages, tools):
+        """
+            在真实工作流中驱动初查、参数拒绝、修正及报告边界。
+
+            Args:
+                messages: 已装配的模型输入。
+                tools: 当前允许调用的工具定义。
+
+            Returns:
+                dict: 预先确定的模型响应。
+        """
+        names = {item["function"]["name"] for item in tools}
+        last = messages[-1]
+        if last["role"] != "tool":
+            initial_tool = "query_metrics" if mode == "single" else "get_application_contract"
+            return reply(call=("initial", initial_tool, {}))
+        result = json.loads(last["content"])
+        if last["tool_call_id"] == "initial":
+            if mode == "single":
+                references.append(result["evidence_id"])
+            return reply(call=("reject_1", tool, rejected_arguments(1)))
+        if last["tool_call_id"] == "repair":
+            assert result["status"] == "ok" and result["version"] == 1
+            assert tool in names and "inspect_process" in names
+            return submit_report(references)
+        assert result["status"] == "error"
+        issue, = result["validation_errors"]
+        if tool == "update_working_memory":
+            index = int(last["tool_call_id"][-1]) - 1
+            assert issue["path"] == ["hypotheses", index, "contradict_ids"]
+            assert "unverified" in issue["message"]
+        else:
+            assert issue["path"] == ["assignments", 0, "question"]
+        if last["tool_call_id"] == "reject_1":
+            assert tool in names
+            if final_response == "repair":
+                payload = {"hypotheses": [{"claim": "仍待验证", "assessment": "unverified"}]}
+                return reply(call=("repair", tool, payload))
+            return reply(call=("reject_2", tool, rejected_arguments(2)))
+        assert "next_step" in result
+        assert names == {"submit_report"}
+        if final_response == "unavailable_tool":
+            return reply(call=("ignored", tool, rejected_arguments(3)))
+        if final_response == "invalid_report":
+            return reply(call=("invalid", "submit_report", {"status": "proposed"}))
+        return submit_report(references)
+
+    app = create_app(Config(data_dir=tmp_path), complete=model, observer=Observer(True))
+    with TestClient(app) as client:
+        client.post("/applications", json={"app_id": "pipeline", "components": ["processor"]}).raise_for_status()
+        incident = client.post("/incidents", json={"app_id": "pipeline", "symptom": "输出停滞"}).json()
+        run = client.post(f"/incidents/{incident['id']}/investigate", params={"mode": mode}).json()
+        assert run["state"] == "COMPLETED", run
+        assert run["report"]["status"] == "needs_human"
+        assert run["report"]["recommended_action"]["evidence_ids"] == references
+        base = f"/runs/{run['id']}"
+        trace = client.get(f"{base}/trace").json()
+        assert len([row for row in trace if row["type"] == "model"]) == 4
+        assert not any(row["type"] == "branch_started" for row in trace)
+        for evidence_id in references:
+            assert client.get(f"{base}/evidence/{evidence_id}").json()["raw"]["status"] == "ok"
+        marked = [row["tool"] for row in trace if row["type"] == "report_only"]
+        assert marked == ([] if final_response == "repair" else [tool])
+        latest = client.get(f"{base}/contexts/4").json()
+        assert latest["manifest"].get("report_only") == (tool if marked else None)
+        if final_response != "repair":
+            assert "工作假设" not in latest["messages"][2].get("content", "") or not marked

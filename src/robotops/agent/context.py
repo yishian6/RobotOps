@@ -15,6 +15,7 @@ from typing import Literal
 
 from ..models import ApplicationContract
 from ..storage import Store
+from .recovery import OPTIONAL_TOOLS
 
 Strategy = Literal["full", "rolling", "evidence"]
 STRATEGIES = {"full", "rolling", "evidence"}
@@ -246,7 +247,11 @@ def assemble(messages: list[dict], memory: dict, strategy: Strategy = "evidence"
             # 历史区头部的 memory 字段下发给模型。旧版本如果再各存一份，归档会随
             # 事实数量二次增长；因此只保留版本引用，完整版本仍可在 memories 表和
             # 请求快照中审查，不重复占用模型输入。
-            if function.get("name") == "update_working_memory":
+            if function.get("name") in OPTIONAL_TOOLS and data.get("status") == "error":
+                # 失败的参数仍在完整轨迹中。模型只需保留纠错反馈，无需重读整份无效草稿。
+                entry.pop("arguments")
+                entry.update(view="optional_tool_error", result=data)
+            elif function.get("name") == "update_working_memory":
                 # 不写 raw_uri，避免暗示该引用可被 read_evidence 回取；记忆正文只能走
                 # memories 表/请求快照或当前头部，不把版本号伪装成证据 ID。
                 entry.update(view="memory_version_reference", version=data.get("version"))
@@ -398,17 +403,25 @@ class ContextSnapshots:
             raise ValueError("Context snapshot integrity check failed")
         return {"sequence": sequence, "sha256": row["sha256"], **json.loads(row["body"])}
 
-    def list(self):
+    def list(self, *, include_roles: bool = False):
         """
             只列序号与哈希，避免查看索引时把所有长上下文加载到 API 响应。
 
             Args:
-                无显式参数。
+                include_roles: 为用量汇总附上角色，缺少角色的旧快照返回 NULL。
 
             Returns:
-                list[dict]: 按序号排列的 sequence/sha256 索引，没有快照时为空。
+                list[dict]: 按序号排列的 sequence/sha256 索引，可附带 agent_role。
         """
         with self.store.connection() as db:
+            # 只投影清单里的角色，避免把每轮请求正文搬到 API 进程里逐条解析。
+            if include_roles:
+                return [
+                    dict(row) for row in db.execute(
+                        "SELECT sequence, sha256, json_extract(body, '$.manifest.agent_role') AS agent_role "
+                        "FROM context_snapshots WHERE run_id=? ORDER BY sequence", (self.run_id,),
+                    )
+                ]
             return [
                 dict(row)
                 for row in db.execute(

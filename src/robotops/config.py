@@ -27,6 +27,9 @@ class Config:
     # 密钥独立于可提交的 TOML，只允许由运行环境注入，repr 也不能显示它。
     api_key: str = field(default="", repr=False)
     model_timeout_seconds: float = 60
+    # 分支等待独立于单次 HTTP 超时和整次调查，给一次取证及一次发现提交留下时间。
+    branch_timeout_seconds: float = 120
+    monitor_interval_seconds: float = 5
     # 模型连接默认直连，避免桌面/终端代理隐式改变后端网络；需要代理时再显式继承环境配置。
     model_trust_env: bool = False
     prompts_dir: Path | None = None
@@ -78,6 +81,10 @@ class Config:
             raise ValueError("Model URL must not contain credentials, query or fragment")
         if not self.model.strip() or not 0 < self.model_timeout_seconds < float("inf"):
             raise ValueError("Model and a finite positive request timeout are required")
+        if type(self.branch_timeout_seconds) not in (int, float) or not 0 < self.branch_timeout_seconds < float("inf"):
+            raise ValueError("Branch timeout must be finite and positive")
+        if type(self.monitor_interval_seconds) not in (int, float) or not 0 < self.monitor_interval_seconds < float("inf"):
+            raise ValueError("Monitor interval must be finite and positive")
 
     @classmethod
     def load(cls):
@@ -107,7 +114,9 @@ class Config:
                 "model",
                 "model_base_url",
                 "model_timeout_seconds",
+                "branch_timeout_seconds",
                 "model_trust_env",
+                "monitor_interval_seconds",
                 "prompts_dir",
                 "prompt_version",
                 "context_strategy",
@@ -129,6 +138,8 @@ class Config:
             "ROBOTOPS_MODEL": ("model", str),
             "ROBOTOPS_MODEL_BASE_URL": ("model_base_url", str),
             "ROBOTOPS_MODEL_TIMEOUT_SECONDS": ("model_timeout_seconds", float),
+            "ROBOTOPS_BRANCH_TIMEOUT_SECONDS": ("branch_timeout_seconds", float),
+            "ROBOTOPS_MONITOR_INTERVAL_SECONDS": ("monitor_interval_seconds", float),
             "ROBOTOPS_PROMPTS_DIR": ("prompts_dir", Path),
             "ROBOTOPS_PROMPT_VERSION": ("prompt_version", str),
             "ROBOTOPS_CONTEXT_STRATEGY": ("context_strategy", str),

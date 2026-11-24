@@ -149,7 +149,7 @@ class DeepSeekClient:
         self.config = config
         self.transport = transport
 
-    def complete(self, messages, tools):
+    def complete(self, messages, tools, *, timeout_seconds: float | None = None):
         """
             同步执行一次框架模型调用，返回现有调查节点使用的消息、用量和模型身份。
 
@@ -159,11 +159,19 @@ class DeepSeekClient:
             Args:
                 messages: 装配后的 system/user/assistant/tool 消息；工具回复必须与调用 ID 配对。
                 tools: 当前网关生成的函数 Schema，直接交给框架绑定，不放宽业务参数校验。
+                timeout_seconds: 子任务剩余的墙钟时长；为 None 时沿用单次网络超时。
 
             Returns:
                 dict: 含白名单 message、已报告 usage 和实际模型名称的响应。
         """
-        return asyncio.run(self._acomplete(messages, tools))
+        request = self._acomplete(messages, tools)
+        if timeout_seconds is None:
+            return asyncio.run(request)
+        try:
+            # 取消异步请求时仍会退出 SDK 的连接上下文，未返回的计费用量保持未知。
+            return asyncio.run(asyncio.wait_for(request, timeout_seconds))
+        except TimeoutError as exc:
+            raise ModelError("Model request exceeded the branch deadline") from exc
 
     async def _acomplete(self, messages, tools):
         """

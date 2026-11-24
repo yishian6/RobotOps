@@ -7,10 +7,17 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .models import ApplicationContract, IncidentCreate, utc_now
+from .models import (
+    ApplicationContract,
+    IncidentCreate,
+    ServiceObservation,
+    ServiceRegistration,
+    utc_now,
+)
 
 
 class ConflictError(ValueError):
@@ -88,6 +95,38 @@ class Store:
                     run_id TEXT NOT NULL REFERENCES runs, sequence INTEGER NOT NULL,
                     body TEXT NOT NULL, sha256 TEXT NOT NULL,
                     PRIMARY KEY(run_id, sequence)
+                );
+                CREATE TABLE IF NOT EXISTS managed_services (
+                    app_id TEXT PRIMARY KEY REFERENCES applications,
+                    scope TEXT NOT NULL, unit TEXT NOT NULL, name TEXT NOT NULL,
+                    config_version INTEGER NOT NULL DEFAULT 1,
+                    observation TEXT NOT NULL, last_known TEXT,
+                    armed INTEGER NOT NULL, last_running_instance TEXT,
+                    UNIQUE(scope, unit)
+                );
+                CREATE TABLE IF NOT EXISTS service_exits (
+                    incident_id TEXT PRIMARY KEY REFERENCES incidents,
+                    app_id TEXT NOT NULL REFERENCES managed_services,
+                    config_version INTEGER NOT NULL,
+                    occurrences INTEGER NOT NULL,
+                    first_observation TEXT NOT NULL, latest_observation TEXT NOT NULL,
+                    first_instance_id TEXT, latest_instance_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS service_exit_app ON service_exits(app_id);
+                CREATE TABLE IF NOT EXISTS executions (
+                    id TEXT PRIMARY KEY, app_id TEXT NOT NULL REFERENCES applications,
+                    started_at TEXT NOT NULL, finished_at TEXT, returncode INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS execution_exits (
+                    incident_id TEXT PRIMARY KEY REFERENCES incidents,
+                    execution_id TEXT NOT NULL REFERENCES executions,
+                    process_name TEXT NOT NULL, exit_code INTEGER NOT NULL, log_end INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ros_fact_tasks (
+                    source_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                    incident_id TEXT NOT NULL UNIQUE REFERENCES incidents,
+                    fact TEXT NOT NULL, run_id TEXT UNIQUE REFERENCES runs,
+                    PRIMARY KEY (source_id, sequence)
                 );
             """)
 
@@ -168,13 +207,333 @@ class Store:
                 dict: 新建事件的 ID、症状、来源、时间及 OPEN 状态。
         """
         self.contract(request.app_id)
+        with self.connection() as db:
+            incident_id = self._insert_incident(db, request, utc_now())
+        return self.incident(incident_id)
+
+    @staticmethod
+    def _insert_incident(db: sqlite3.Connection, request: IncidentCreate, timestamp: str) -> str:
+        """
+            在调用方的事务内写入一条事件，供手工接入和检测器共用。
+
+            Args:
+                db: 已开启的数据库连接。
+                request: 关联应用、事件症状与来源。
+                timestamp: 手工提交或第一次检测到异常的 UTC 时间。
+
+            Returns:
+                str: 新建事件的编号。
+        """
         incident_id = f"inc-{uuid4().hex}"
+        db.execute(
+            "INSERT INTO incidents VALUES (?, ?, ?, ?, 'OPEN', ?)",
+            (incident_id, request.app_id, request.symptom, request.source, timestamp),
+        )
+        return incident_id
+
+    def ingest_ros_facts(self, app_id: str, facts: list[dict]) -> None:
+        """Atomically create an incident and its automatic task for each new fact."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for fact in facts:
+                identity = (fact["source_id"], fact["sequence"])
+                exists = db.execute(
+                    "SELECT 1 FROM ros_fact_tasks WHERE source_id=? AND sequence=?", identity,
+                ).fetchone()
+                if exists:
+                    continue
+                request = IncidentCreate(
+                    app_id=app_id, source="detector",
+                    symptom=f"ROS 1 Topic {fact['topic']} had no messages for {fact['silent_ms']} ms",
+                )
+                incident_id = self._insert_incident(db, request, utc_now())
+                db.execute(
+                    "INSERT INTO ros_fact_tasks (source_id, sequence, incident_id, fact) "
+                    "VALUES (?, ?, ?, ?)",
+                    (*identity, incident_id, json.dumps(fact, ensure_ascii=False)),
+                )
+
+    def ros_fact_cursor(self, source_id: str) -> int:
+        """Return the last imported sequence for one independent fact database."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM ros_fact_tasks WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+        return row[0]
+
+    def pending_ros_facts(self, app_id: str) -> list[str]:
+        """List automatic tasks that have yet to be claimed."""
+        with self.connection() as db:
+            return [
+                row["incident_id"] for row in db.execute(
+                    "SELECT t.incident_id FROM ros_fact_tasks t JOIN incidents i ON i.id=t.incident_id "
+                    "WHERE i.app_id=? AND t.run_id IS NULL ORDER BY t.rowid LIMIT 100",
+                    (app_id,),
+                )
+            ]
+
+    def interrupt_ros_fact_runs(self, app_id: str) -> None:
+        """Reconcile interrupted work after taking the app's exclusive worker lock."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = db.execute(
+                "SELECT r.id, r.incident_id FROM runs r JOIN ros_fact_tasks t ON t.run_id=r.id "
+                "JOIN incidents i ON i.id=r.incident_id WHERE i.app_id=? AND r.state='RUNNING'",
+                (app_id,),
+            ).fetchall()
+            for row in active:
+                db.execute(
+                    "UPDATE runs SET state='FAILED', finished_at=?, error=? WHERE id=?",
+                    (utc_now(), "Automatic ROS investigation was interrupted", row["id"]),
+                )
+                db.execute(
+                    "UPDATE incidents SET state='NEEDS_HUMAN' WHERE id=?", (row["incident_id"],),
+                )
+
+    def register_service(self, request: ServiceRegistration, observation: ServiceObservation) -> dict:
+        """
+            为已有服务生成最小应用契约，并在同一事务保存服务登记和首份观测。
+
+            Args:
+                request: 调用者填写的服务和可选显示名。
+                observation: 登记前读取的状态，包含 systemd 返回的规范名称。
+
+            Returns:
+                dict: 已保存的登记、当前状态和配置版本。
+        """
+        if not observation.unit:
+            raise ValueError("A readable service observation is required for registration")
+        name = (request.name or "").strip() or observation.unit
+        app_id = f"svc-{uuid4().hex}"
+        contract = ApplicationContract(app_id=app_id, components=["service"], description=name)
+        sample = observation.model_dump_json()
+        running = observation.state == "running"
+        with self.connection() as db:
+            db.execute("INSERT INTO applications VALUES (?, ?)", (app_id, contract.model_dump_json()))
+            try:
+                db.execute(
+                    "INSERT INTO managed_services "
+                    "(app_id, scope, unit, name, observation, last_known, armed, last_running_instance) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        app_id, request.scope, observation.unit, name, sample,
+                        sample if observation.state != "unknown" else None,
+                        int(running), observation.instance_id if running else None,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # 规范名称唯一约束使别名与原名称的重复登记一并回滚。
+                raise ConflictError("Service already registered in this scope") from exc
+        return self.services(app_id)[0]
+
+    def services(self, app_id: str | None = None) -> list[dict]:
+        """
+            读取已登记服务及最新状态。查询失败后仍保留上一次可解读的观测。
+
+            Args:
+                app_id: 可选应用编号，为 None 时列出全部服务。
+
+            Returns:
+                list[dict]: 服务配置、当前与最后有效观测。
+        """
+        fields = (
+            "SELECT app_id, scope, unit, name, config_version, observation, last_known "
+            "FROM managed_services"
+        )
+        with self.connection() as db:
+            rows = db.execute(
+                fields + " ORDER BY scope, unit" if app_id is None else fields + " WHERE app_id=?",
+                () if app_id is None else (app_id,),
+            ).fetchall()
+        if app_id is not None and not rows:
+            raise KeyError("Managed service not found")
+        result = []
+        for row in rows:
+            service = dict(row)
+            for field in ("observation", "last_known"):
+                service[field] = json.loads(row[field]) if row[field] else None
+            result.append(service)
+        return result
+
+    def record_service_observation(self, app_id: str, observation: ServiceObservation) -> dict:
+        """
+            持久化读数，首次确认运行后的失败创建事件，持续异常续记原事件。
+
+            Args:
+                app_id: 服务登记生成的应用编号。
+                observation: 本次只读探测的结果，包含探测开始时间。
+
+            Returns:
+                dict: 当前状态、关联事件编号与本次是否创建事件。
+        """
+        with self.connection() as db:
+            # 读取基线与写事件用同一写事务。并发监测进程不能同时创建两个活跃事件。
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM managed_services WHERE app_id=?", (app_id,)).fetchone()
+            if row is None:
+                raise KeyError("Managed service not found")
+            previous = ServiceObservation.model_validate_json(row["observation"])
+            if observation.observed_at <= previous.observed_at:
+                return {"state": previous.state, "incident_id": None, "created": False}
+            if observation.unit != row["unit"] and (observation.unit is not None or observation.state != "unknown"):
+                # 规范名称变化可能意味着别名被重新绑定。旧登记不得替新目标作故障判断。
+                observation = ServiceObservation(
+                    observed_at=observation.observed_at, state="unknown", detail="服务规范名称发生变化"
+                )
+            state = observation.state
+            sample = observation.model_dump_json()
+            last_known = row["last_known"] if state == "unknown" else sample
+            armed = (state == "running") if state in {"running", "stopped"} else bool(row["armed"])
+            instance = observation.instance_id if state == "running" else row["last_running_instance"]
+            db.execute(
+                "UPDATE managed_services SET observation=?, last_known=?, armed=?, last_running_instance=? "
+                "WHERE app_id=?",
+                (sample, last_known, int(armed), instance, app_id),
+            )
+            if state != "failed" or not armed:
+                # 首次登记时已经停止、干净停止和观测不可用都不构成新的意外退出。
+                return {"state": state, "incident_id": None, "created": False}
+
+            active = db.execute(
+                "SELECT e.incident_id FROM service_exits e JOIN incidents i ON i.id=e.incident_id "
+                "WHERE e.app_id=? AND i.state!='RESOLVED'",
+                (app_id,),
+            ).fetchone()
+            failed_instance = observation.instance_id or instance
+            if active is not None:
+                incident_id = active["incident_id"]
+                db.execute(
+                    "UPDATE service_exits SET latest_observation=?, latest_instance_id=?, "
+                    "occurrences=occurrences+1 WHERE incident_id=?",
+                    (sample, failed_instance, incident_id),
+                )
+                return {"state": state, "incident_id": incident_id, "created": False}
+            incident_id = self._insert_incident(db, IncidentCreate(
+                app_id=app_id, symptom=f"服务 {row['unit']} 意外退出（{observation.result}）", source="detector",
+            ), observation.observed_at.isoformat())
+            db.execute(
+                "INSERT INTO service_exits VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                (incident_id, app_id, row["config_version"], sample, sample, failed_instance, failed_instance),
+            )
+            return {"state": state, "incident_id": incident_id, "created": True}
+
+    def start_execution(self, app_id: str, execution_id: str) -> None:
+        """
+            首次启动时自动登记最小契约，并保存独立运行标识。
+
+            Args:
+                app_id: 操作员指定的应用名。
+                execution_id: 关联本次终端输出的唯一编号。
+
+            Returns:
+                None: 登记和运行记录已一起提交。
+        """
+        contract = ApplicationContract(app_id=app_id, components=["process"])
+        with self.connection() as db:
+            # 同一应用可由多个终端同时启动；已有契约的组件和版本以显式登记为准。
+            db.execute(
+                "INSERT INTO applications VALUES (?, ?) ON CONFLICT(app_id) DO NOTHING",
+                (app_id, contract.model_dump_json()),
+            )
+            db.execute(
+                "INSERT INTO executions (id, app_id, started_at) VALUES (?, ?, ?)",
+                (execution_id, app_id, utc_now()),
+            )
+
+    def finish_execution(self, execution_id: str, returncode: int) -> None:
+        """
+            记录本次启动命令的最终退出状态。
+
+            Args:
+                execution_id: 此次前台运行编号。
+                returncode: 原始进程返回码，负值表示收到信号。
+
+            Returns:
+                None: 退出状态已提交。
+        """
         with self.connection() as db:
             db.execute(
-                "INSERT INTO incidents VALUES (?, ?, ?, ?, 'OPEN', ?)",
-                (incident_id, request.app_id, request.symptom, request.source, utc_now()),
+                "UPDATE executions SET finished_at=?, returncode=? WHERE id=?",
+                (utc_now(), returncode, execution_id),
             )
-        return self.incident(incident_id)
+
+    def record_execution_exit(
+        self, execution_id: str, process_name: str, exit_code: int, log_end: int,
+    ) -> str:
+        """
+            记录一次异常退出及对应的控制台日志位置。
+
+            Args:
+                execution_id: 已登记的前台启动编号。
+                process_name: 启动命令或 ROS 提供的进程名。
+                exit_code: 进程返回码。
+                log_end: 事件产生时已写入日志的字节数。
+
+            Returns:
+                str: 可用于查询故障和日志的事件编号。
+        """
+        with self.connection() as db:
+            app = db.execute("SELECT app_id FROM executions WHERE id=?", (execution_id,)).fetchone()
+            if app is None:
+                raise KeyError("Execution not found")
+            incident_id = self._insert_incident(
+                db, IncidentCreate(
+                    app_id=app["app_id"], symptom=f"进程 {process_name[:512]} 意外退出（{exit_code}）",
+                    source="detector",
+                ), utc_now(),
+            )
+            # 日志仍可随着其他节点继续运行增长，固定位置保证后续查询读到的是故障当时的窗口。
+            db.execute(
+                "INSERT INTO execution_exits VALUES (?, ?, ?, ?, ?)",
+                (incident_id, execution_id, process_name, exit_code, log_end),
+            )
+        return incident_id
+
+    def execution_logs(
+        self, incident_id: str, keyword: str = "", limit: int = 30, since: datetime | None = None,
+    ) -> dict:
+        """
+            从事件关联的日志读取故障前的控制台片段。
+
+            Args:
+                incident_id: 事件编号，由工具网关绑定到当前调查。
+                keyword: 可选的字面关键词，忽略大小写。
+                limit: 最多返回的匹配行数。
+                since: 起始时间，用于筛选事件快照，日志行沿用进程自身时间格式。
+
+            Returns:
+                dict: 故障进程、采集范围、日志行与截断标记。
+        """
+        incident = self.incident(incident_id)
+        exit_record = incident.get("execution_exit")
+        if exit_record is None:
+            raise KeyError("No console log for this incident")
+        end = exit_record["log_end"]
+        # 按字节向前读取使大文件查询成本稳定；输出其余部分仍可从本地原文件查看。
+        start = max(0, end - 64 * 1024)
+        observed_at = incident["created_at"]
+        within_range = since is None or datetime.fromisoformat(observed_at) >= since
+        if not within_range:
+            lines = []
+        else:
+            path = self.root / "executions" / f"{exit_record['execution_id']}.log"
+            with path.open("rb") as log:
+                log.seek(max(0, start - 1))
+                fragment = log.read(end - max(0, start - 1))
+            if start:
+                # 首字节用于判断是否落在行边界；残缺行可能误导关键词匹配。
+                fragment = fragment[1:] if fragment.startswith(b"\n") else fragment.partition(b"\n")[2]
+            needle = keyword.casefold()
+            lines = [
+                line for line in fragment.decode(errors="replace").splitlines()
+                if needle in line.casefold()
+            ]
+        return {
+            "source": "captured_console", "runtime_id": exit_record["execution_id"],
+            "process_name": exit_record["process_name"], "captured_at": observed_at,
+            "lines": lines[-limit:], "truncated": within_range and bool(start or len(lines) > limit),
+        }
 
     def incident(self, incident_id: str):
         """
@@ -188,9 +547,34 @@ class Store:
         """
         with self.connection() as db:
             row = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
-        if row is None:
-            raise KeyError("Incident not found")
-        return dict(row)
+            if row is None:
+                raise KeyError("Incident not found")
+            exit_record = db.execute(
+                "SELECT config_version, occurrences, first_observation, latest_observation, "
+                "first_instance_id, latest_instance_id FROM service_exits WHERE incident_id=?",
+                (incident_id,),
+            ).fetchone()
+            execution_exit = db.execute(
+                "SELECT execution_id, process_name, exit_code, log_end "
+                "FROM execution_exits WHERE incident_id=?", (incident_id,),
+            ).fetchone()
+            fact_task = db.execute(
+                "SELECT t.fact, t.run_id, r.state FROM ros_fact_tasks t "
+                "LEFT JOIN runs r ON r.id=t.run_id WHERE t.incident_id=?", (incident_id,),
+            ).fetchone()
+        result = dict(row)
+        if exit_record is not None:
+            extension = dict(exit_record)
+            for field in ("first_observation", "latest_observation"):
+                extension[field] = json.loads(extension[field])
+            result["service_exit"] = extension
+        if execution_exit is not None:
+            result["execution_exit"] = dict(execution_exit)
+        if fact_task is not None:
+            result["ros_fact"] = json.loads(fact_task["fact"])
+            result["automatic_run_id"] = fact_task["run_id"]
+            result["automatic_task_state"] = fact_task["state"] or "QUEUED"
+        return result
 
     def incidents(self):
         """
@@ -205,7 +589,7 @@ class Store:
         with self.connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM incidents ORDER BY created_at")]
 
-    def start_run(self, incident_id: str, model: str):
+    def start_run(self, incident_id: str, model: str, *, automatic: bool = False):
         """
             同一事务创建 RUNNING 记录并将事件改为 INVESTIGATING，返回运行 ID。
 
@@ -215,6 +599,7 @@ class Store:
             Args:
                 incident_id (str): 已登记的异常事件 ID，用于绑定应用与调查状态。
                 model (str): 运行记录中保存的模型标识，不在此方法内调用模型。
+            automatic (bool): 在同一事务认领已存在的自动任务。
 
             Returns:
                 str: 新建的 run- 前缀运行 ID。
@@ -231,6 +616,13 @@ class Store:
                 )
             except sqlite3.IntegrityError as exc:
                 raise ConflictError("Incident already has a running investigation") from exc
+            if automatic:
+                claimed = db.execute(
+                    "UPDATE ros_fact_tasks SET run_id=? WHERE incident_id=? AND run_id IS NULL",
+                    (run_id, incident_id),
+                )
+                if claimed.rowcount != 1:
+                    raise ConflictError("Automatic investigation task already claimed or missing")
             # 和运行插入同事务提交；插入冲突时回滚，事件不会被误标为调查中。
             db.execute("UPDATE incidents SET state='INVESTIGATING' WHERE id=?", (incident_id,))
         return run_id
