@@ -84,9 +84,19 @@ def dispatch_facts(
     """Persist facts as tasks, then run each pending task once with a bounded model budget."""
     scope = batch.model_dump(exclude={"events"})
     store.ingest_ros_facts(batch.app_id, [{**scope, **event.model_dump()} for event in batch.events])
+    return _run_pending_facts(store, config, batch.app_id, complete, max_model_calls)
+
+
+def _run_pending_facts(
+    store: Store, config: Config, app_id: str, complete, max_model_calls: int,
+) -> list[dict]:
+    """Investigate persisted observations independently of the collector connection."""
+    pending = store.pending_ros_facts(app_id)
+    if not pending:
+        return []
     prompt = load_investigation_prompt(config.prompt_version, config.prompts_dir)
     results = []
-    for incident_id in store.pending_ros_facts(batch.app_id):
+    for incident_id in pending:
         calls = 0
 
         def bounded_complete(messages, tools):
@@ -130,13 +140,15 @@ def watch_facts(
                 batch = fetch_facts(store, app_id, port)
             except (OSError, HTTPException, ValueError) as exc:
                 print(f"ROS 1 observation unavailable: {exc}", file=sys.stderr)
-                if once:
-                    return 1
+                exit_status = 1
+                runs = _run_pending_facts(store, config, app_id, complete, max_model_calls)
             else:
-                for run in dispatch_facts(
+                exit_status = 0
+                runs = dispatch_facts(
                     store, config, batch, complete, max_model_calls=max_model_calls,
-                ):
-                    print(json.dumps(run, ensure_ascii=False), flush=True)
-                if once:
-                    return 0
+                )
+            for run in runs:
+                print(json.dumps(run, ensure_ascii=False), flush=True)
+            if once:
+                return exit_status
             sleep(config.monitor_interval_seconds)

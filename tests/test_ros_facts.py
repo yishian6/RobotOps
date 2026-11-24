@@ -5,13 +5,14 @@ import socket
 import sqlite3
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from http.client import HTTPConnection
 from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
 
+from robotops.agent.client import ModelError
 from robotops.config import Config
 from robotops.models import ApplicationContract
 from robotops.ros_facts import FactBatch, dispatch_facts, fetch_facts, watch_facts
@@ -31,16 +32,28 @@ def complete_with_ros_evidence(messages, _tools):
     })}}
 
 
-def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path):
-    store = Store(tmp_path)
-    store.register(ApplicationContract(app_id="camera", components=["camera"]))
-    batch = FactBatch.model_validate({
+class ScriptedClient:
+    def __init__(self, _config):
+        pass
+
+    complete = staticmethod(complete_with_ros_evidence)
+
+
+@pytest.fixture
+def topic_batch():
+    return FactBatch.model_validate({
         "source_id": "a" * 32, "app_id": "camera", "topic": "/smoke/output",
         "events": [{
             "sequence": 1, "kind": "topic_silent", "observed_at_ms": 1700000003000,
             "last_message_at_ms": 1700000000000, "silent_ms": 3000, "threshold_ms": 2000,
         }],
     })
+
+
+def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path, topic_batch):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    batch = topic_batch
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(
@@ -59,6 +72,77 @@ def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path):
     assert raw == {**batch.events[0].model_dump(), "source_id": batch.source_id,
                    "app_id": batch.app_id, "topic": batch.topic}
     assert dispatch_facts(store, Config(data_dir=tmp_path), batch, complete_with_ros_evidence) == []
+
+
+def test_idle_fact_poll_needs_neither_a_write_lock_nor_prompt(tmp_path, topic_batch, monkeypatch):
+    store = Store(tmp_path)
+    original_connection = store.connection
+
+    @contextmanager
+    def connection_without_waiting():
+        with original_connection() as db:
+            db.execute("PRAGMA busy_timeout=0")
+            yield db
+
+    def unexpected_call(*_):
+        pytest.fail("An idle worker should neither read the prompt nor call the model")
+
+    monkeypatch.setattr(store, "connection", connection_without_waiting)
+    monkeypatch.setattr("robotops.ros_facts.load_investigation_prompt", unexpected_call)
+    idle = topic_batch.model_copy(update={"events": []})
+    with original_connection() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        assert dispatch_facts(store, Config(data_dir=tmp_path), idle, unexpected_call) == []
+
+
+def test_worker_runs_persisted_task_while_collector_is_unavailable(
+    tmp_path, topic_batch, monkeypatch, capsys,
+):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    scope = topic_batch.model_dump(exclude={"events"})
+    store.ingest_ros_facts("camera", [{**scope, **topic_batch.events[0].model_dump()}])
+    incident, = store.incidents()
+
+    def offline_collector(*_):
+        raise ConnectionRefusedError("collector offline")
+
+    monkeypatch.setattr("robotops.ros_facts.fetch_facts", offline_collector)
+    monkeypatch.setattr("robotops.ros_facts.DeepSeekClient", ScriptedClient)
+    config = Config(data_dir=tmp_path)
+
+    assert watch_facts(config, "camera", 8081, once=True, max_model_calls=6) == 1
+    output = capsys.readouterr()
+    assert "collector offline" in output.err
+    run = json.loads(output.out)
+    assert run["state"] == "COMPLETED"
+    assert store.incident(incident["id"])["automatic_run_id"] == run["id"]
+    evidence_id, = run["report"]["hypotheses"][0]["evidence_ids"]
+    assert store.read_evidence(run["id"], evidence_id)["raw"]["data"]["source_id"] == scope["source_id"]
+    assert store.pending_ros_facts("camera") == []
+    assert len(store.incidents()) == 1
+
+
+def test_fallback_report_cites_trigger_observation(tmp_path, topic_batch):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    call_count = 0
+
+    def complete(_messages, tools):
+        nonlocal call_count
+        call_count += 1
+        if [tool["function"]["name"] for tool in tools] == ["submit_report"]:
+            raise ModelError("Model could not finish the report")
+        return {"message": {"role": "assistant", "tool_calls": [{
+            "id": f"memory-{call_count}", "type": "function",
+            "function": {"name": "update_working_memory", "arguments": '{"phase":"invalid"}'},
+        }]}}
+
+    run, = dispatch_facts(store, Config(data_dir=tmp_path), topic_batch, complete)
+    assert run["state"] == "COMPLETED"
+    assert run["report"]["status"] == "needs_human"
+    evidence_id, = run["report"]["recommended_action"]["evidence_ids"]
+    assert store.read_evidence(run["id"], evidence_id)["tool"] == "ros1_topic_observation"
 
 
 def local_port():
@@ -180,12 +264,6 @@ while not rospy.is_shutdown():
         batch = wait_until(outage)
         assert publisher.poll() is None
         assert len(batch.events) == 1
-        class ScriptedClient:
-            def __init__(self, _config):
-                pass
-
-            complete = staticmethod(complete_with_ros_evidence)
-
         monkeypatch.setattr("robotops.ros_facts.DeepSeekClient", ScriptedClient)
         assert watch_facts(config, "camera", port, once=True, max_model_calls=6) == 0
         run = json.loads(capsys.readouterr().out)

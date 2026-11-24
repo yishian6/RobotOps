@@ -233,6 +233,8 @@ class Store:
 
     def ingest_ros_facts(self, app_id: str, facts: list[dict]) -> None:
         """Atomically create an incident and its automatic task for each new fact."""
+        if not facts:
+            return
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             for fact in facts:

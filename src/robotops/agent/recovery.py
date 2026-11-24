@@ -13,15 +13,15 @@ class InvestigationRecovery:
         在一次主调查中记录可修正的错误和已取得的现场证据。
     """
 
-    def __init__(self):
+    def __init__(self, initial_evidence_ids: tuple[str, ...] = ()):
         """
-            建立独立的错误历史，避免角色或调查之间共享重试状态。
+            建立独立的错误历史，保留调查触发时已取得的现场证据。
 
             Returns:
                 None: 尚未触发收尾的状态。
         """
         self.failures: dict[str, set[tuple]] = {}
-        self.evidence_ids: list[str] = []
+        self.evidence_ids = list(initial_evidence_ids)
         self.failed_tool: str | None = None
 
     def record(self, tool: str, result: dict) -> dict:
