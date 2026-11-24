@@ -87,11 +87,11 @@ def test_cli_defaults_to_offline_and_previews_paid_matrix(monkeypatch, capsys):
     assert "paid runs require" in capsys.readouterr().err
     assert e2e.main([
         "--provider", "deepseek", "--scenarios", "processing_stalled",
-        "--strategies", "evidence", "--modes", "single,adaptive", "--repeats", "1", "--plan",
+        "--strategies", "evidence", "--modes", "single,supervised", "--repeats", "1", "--plan",
     ]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["planned_investigations"] == 2 and plan["real_model_calls"] == 0
-    assert plan["scenarios"] == ["processing_stalled"] and plan["modes"] == ["single", "adaptive"]
+    assert plan["scenarios"] == ["processing_stalled"] and plan["modes"] == ["single", "supervised"]
     evaluate_mock.assert_not_called()
     assert e2e.main([]) == 0
     evaluate_mock.assert_called_once_with("scripted", list(SCENARIOS), ["evidence", "full"], 1, ("single",))

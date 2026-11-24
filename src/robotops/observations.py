@@ -8,11 +8,15 @@ from typing import Protocol
 # 上下文按显式组件名和实例 ID 标记旧证据。两者必须成对保留，不能只依赖外层字典键。
 _INSTANCE_FIELDS = {"component", "instance_id", "started_at", "heartbeat_at", "config_version"}
 _PROCESS_ID_FIELDS = {"pid", "alive", "state", "start_ticks"}
+_METRIC_ALIASES = {
+    "processing_age_ms": "in_flight_processing_age_ms",
+    "processing_latency_ms": "last_completed_processing_latency_ms",
+}
 _METRIC_FIELDS = _INSTANCE_FIELDS | {
     "sent_count", "received_count", "processed_count", "rejected_count",
     "last_input_at", "last_output_at", "processing_started_at", "processing_age_ms",
     "processing_latency_ms", "end_to_end_latency_ms",
-}
+} | set(_METRIC_ALIASES.values())
 
 
 def compact_model_observation(tool: str, result: dict) -> dict:
@@ -45,12 +49,12 @@ def compact_model_observation(tool: str, result: dict) -> dict:
             projected[name] = component
             continue
         telemetry_fields = _METRIC_FIELDS if metrics else _INSTANCE_FIELDS
-        projected[name] = {
-            **component,
-            "telemetry": {
-                key: value for key, value in telemetry.items() if key in telemetry_fields
-            },
-        }
+        fields = {key: value for key, value in telemetry.items() if key in telemetry_fields}
+        if metrics:
+            for legacy, explicit in _METRIC_ALIASES.items():
+                if legacy in fields:
+                    fields.setdefault(explicit, fields.pop(legacy))
+        projected[name] = {**component, "telemetry": fields}
         process = component.get("process")
         if metrics and isinstance(process, dict):
             # 指标保留进程身份，详细资源数据从 inspect_process 获取，避免同一轮重复发送。

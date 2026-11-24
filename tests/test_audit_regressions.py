@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from robotops_examples.pipeline.observer import PipelineObserver
 from robotops_examples.pipeline.runtime import PipelineRuntime
 
+from robotops.agent.context import ContextSnapshots
 from robotops.agent.prompt_loader import load_investigation_prompt
 from robotops.api import create_app
 from robotops.config import Config
@@ -33,6 +34,23 @@ def manual_report():
         "summary": "测试报告，证据不足。",
         "recommended_action": {"kind": "manual_review", "reason": "需要进一步观测"},
     }
+
+
+def test_audit_artifacts_remain_readable_when_report_json_is_damaged(tmp_path):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    incident = store.create_incident(IncidentCreate(app_id="camera", symptom="no output"))
+    run_id = store.start_run(incident["id"], "fixture")
+    store.trace(run_id, {"type": "model"})
+    sequence = ContextSnapshots(store, run_id).save([], [], {}, {})
+    store.finish_run(run_id, report=manual_report())
+    with store.connection() as db:
+        db.execute("UPDATE runs SET report=? WHERE id=?", ("{", run_id))
+
+    with pytest.raises(json.JSONDecodeError):
+        store.run(run_id)
+    assert store.trace(run_id)[0]["type"] == "model"
+    assert ContextSnapshots(store, run_id).get(sequence)["messages"] == []
 
 
 def test_core_accepts_real_component_names_without_example_defaults(tmp_path):

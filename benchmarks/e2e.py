@@ -22,8 +22,7 @@ from robotops_examples.pipeline.runtime import PipelineRuntime
 
 from robotops.agent.client import DeepSeekClient, _reported_usage
 from robotops.agent.context import ContextSnapshots
-from robotops.agent.supervision import INVESTIGATION_MODES, InvestigationMode
-from robotops.agent.workflow import investigate
+from robotops.agent.workflow import INVESTIGATION_MODES, InvestigationMode, investigate
 from robotops.config import Config
 from robotops.models import ApplicationContract, DiagnosticReport, IncidentCreate, utc_now
 from robotops.storage import Store
@@ -412,6 +411,7 @@ def run_once(
                 "scripted-model" if provider == "scripted" else config.model,
                 context_strategy=strategy,
                 mode=investigation_mode,
+                branch_timeout_seconds=config.branch_timeout_seconds if config else Config.branch_timeout_seconds,
             )
         finally:
             runtime.stop()
@@ -460,7 +460,6 @@ def run_once(
             ),
             "snapshots": snapshots,
             "role_prompt_sha256": initial_prompt.get("role_prompt_sha256"),
-            "adaptive_prompt_sha256": initial_prompt.get("adaptive_prompt_sha256"),
             **usage,
             "missing_usage": missing,
             "branches": [{"role": event["agent_role"], "status": event["status"]} for event in branches],
@@ -601,7 +600,7 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", choices=("scripted", "deepseek"), default="scripted")
     parser.add_argument("--scenarios", help="all 或逗号分隔的场景名")
     parser.add_argument("--strategies")
-    parser.add_argument("--modes", help="逗号分隔的 single,supervised,adaptive 调查模式")
+    parser.add_argument("--modes", help="逗号分隔的 single,supervised 调查模式")
     parser.add_argument("--repeats", type=int)
     parser.add_argument("--plan", action="store_true", help="只预览评测矩阵，不读取模型配置或开始调查")
     parser.add_argument("--output", type=Path, help="可选 JSON 结果路径")
@@ -620,7 +619,7 @@ def main(argv=None) -> int:
     if not set(strategies) <= {"full", "rolling", "evidence"} or len(set(strategies)) != len(strategies):
         parser.error("strategies must be a unique list drawn from full, rolling, evidence")
     if not set(modes) <= set(INVESTIGATION_MODES) or len(set(modes)) != len(modes):
-        parser.error("modes must be a unique list drawn from single, supervised, adaptive")
+        parser.error("modes must be a unique list drawn from single, supervised")
     if args.provider == "scripted" and modes != ("single",):
         parser.error("the scripted benchmark only supports single mode")
     if repeats < 1:

@@ -10,24 +10,20 @@ from .agent.client import DeepSeekClient, ModelError
 from .agent.context import ContextSnapshots
 from .agent.memory import MemoryStore
 from .agent.prompt_loader import load_investigation_prompt
-from .agent.supervision import (
-    ADAPTIVE_PROMPT_VERSION,
-    DEFAULT_API_MODE,
-    INVESTIGATION_MODES,
-    ROLE_PROMPT_VERSION,
-    InvestigationMode,
-    load_role_prompts,
-)
-from .agent.workflow import investigate
+from .agent.supervision import ROLE_PROMPT_VERSION, load_role_prompts
+from .agent.usage import summarize_usage
+from .agent.workflow import DEFAULT_API_MODE, INVESTIGATION_MODES, InvestigationMode, investigate
 from .config import Config
-from .models import ApplicationContract, IncidentCreate
+from .models import ApplicationContract, IncidentCreate, ServiceRegistration
 from .observations import ObservationSource, ObservationUnavailable
 from .retrieval import CaseCreate, CaseLibrary
+from .service_manager import ServiceManager, SystemdServiceManager
 from .storage import ConflictError, Store
 
 
 def create_app(
-    config: Config | None = None, complete=None, observer: ObservationSource | None = None
+    config: Config | None = None, complete=None, observer: ObservationSource | None = None, *,
+    service_manager: ServiceManager | None = None,
 ):
     """
         构造核心服务，只接收配置、模型调用和只读观测，不启动示例进程。
@@ -41,6 +37,7 @@ def create_app(
             config (Config | None): 启动配置快照；为 None 时通过 Config.load() 合并文件与环境变量。
             complete: 接收 messages/tools 的模型调用函数；为 None 时在实际调查时使用 DeepSeek。
             observer (ObservationSource | None): 当前应用的只读观测适配器；为 None 时环境观测返回不可用。
+            service_manager: 服务登记的只读探测入口；默认读取本机 systemd。
 
         Returns:
             FastAPI: 挂载核心业务接口并绑定 Store 的本地服务实例。
@@ -50,6 +47,7 @@ def create_app(
     prompt = load_investigation_prompt(config.prompt_version, config.prompts_dir)
     role_prompts = load_role_prompts()
     store = Store(config.data_dir)
+    service_manager = service_manager if service_manager is not None else SystemdServiceManager()
     app = FastAPI(title="RobotOps Agent", version=__version__)
     app.state.store = store
 
@@ -133,7 +131,6 @@ def create_app(
             "investigation_modes": list(INVESTIGATION_MODES),
             "default_investigation_mode": DEFAULT_API_MODE,
             "supervision_prompt": {"version": ROLE_PROMPT_VERSION, "sha256": role_prompts.sha256},
-            "adaptive_prompt": {"version": ADAPTIVE_PROMPT_VERSION, "sha256": role_prompts.adaptive_sha256},
         }
 
     @app.post("/applications", status_code=201)
@@ -148,6 +145,45 @@ def create_app(
                 dict: 已持久化的应用契约，路由成功状态为 201。
         """
         return store.register(contract)
+
+    @app.post("/services", status_code=201)
+    def register_service(request: ServiceRegistration):
+        """
+            探测目标后登记一个已有的服务，并为它生成默认应用契约。
+
+            Args:
+                request: systemd 单元、管理器范围及可选显示名。
+
+            Returns:
+                dict: 登记编号和首次观测，供独立 monitor 进程读取。
+        """
+        observation = service_manager.inspect(request)
+        if observation.unit is None:
+            raise ObservationUnavailable(observation.detail or "Unable to identify systemd service")
+        return store.register_service(request, observation)
+
+    @app.get("/services")
+    def services():
+        """
+            列出服务及最后保存的读数，供用户复核登记和监测状态。
+
+            Returns:
+                list[dict]: 以单元及作用域组织的服务状态。
+        """
+        return store.services()
+
+    @app.get("/services/{app_id}")
+    def service(app_id: str):
+        """
+            查询单个登记的服务。
+
+            Args:
+                app_id: 登记时生成的应用编号。
+
+            Returns:
+                dict: 该服务的当前与最后有效观测。
+        """
+        return store.services(app_id)[0]
 
     @app.get("/applications/{app_id}")
     def application(app_id: str):
@@ -259,6 +295,23 @@ def create_app(
         """
         return store.incident(incident_id)
 
+    @app.get("/incidents/{incident_id}/logs")
+    def incident_logs(incident_id: str, limit: int = Query(default=30, ge=1, le=200)):
+        """
+            查询一次启动故障对应的控制台输出片段。
+
+            Args:
+                incident_id: 关联启动记录的事件编号。
+                limit: 最多返回的日志行数。
+
+            Returns:
+                dict: 故障进程、采集时间和日志片段。
+        """
+        try:
+            return store.execution_logs(incident_id, limit=limit)
+        except OSError as exc:
+            raise ObservationUnavailable("Console log is unavailable") from exc
+
     @app.post("/incidents/{incident_id}/investigate")
     def investigate_incident(incident_id: str, mode: InvestigationMode = DEFAULT_API_MODE):
         """
@@ -269,7 +322,7 @@ def create_app(
 
             Args:
                 incident_id (str): 已登记的异常事件 ID，用于绑定应用与调查状态。
-                mode (InvestigationMode): 默认按需委派，可显式选择单 Agent 或 M1 监督对照。
+                mode (InvestigationMode): 默认单 Agent，可显式选择层级式调查。
 
             Returns:
                 dict: 调查运行记录；必须检查 state/error，HTTP 成功不等同于诊断成功。
@@ -287,6 +340,7 @@ def create_app(
             config.context_strategy,
             mode=mode,
             role_prompts=role_prompts,
+            branch_timeout_seconds=config.branch_timeout_seconds,
         )
 
     @app.get("/runs/{run_id}")
@@ -380,37 +434,7 @@ def create_app(
             Returns:
                 dict: 实报输入/输出及缓存用量、各项缺失计数和请求数量。
         """
-        events = [item for item in store.trace(run_id) if item["type"] in {"model", "model_error"}]
-        # 用量总和与缺失次数分开统计；部分供应商只报告部分字段，不能把空缺补成零费用。
-        cache_fields = ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
-        counts = dict.fromkeys(("prompt_tokens", "completion_tokens", *cache_fields), 0)
-        missing = {key: 0 for key in counts}
-        for event in events:
-            data = event.get("usage") or {}
-            for key in counts:
-                value = data.get(key)
-                # 缺失、负数和布尔值都不算已报告用量，避免把错误返回当成完整计费数据。
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    counts[key] += value
-                else:
-                    missing[key] += 1
-        requests = len(ContextSnapshots(store, run_id).list())
-        # 兼容没有逐轮快照的旧运行；同时让已保存请求但没收到可记录响应的尝试显式留为未知。
-        unreported = max(0, requests - len(events))
-        for key in missing:
-            missing[key] += unreported
-        return {
-            "recorded_attempts": len(events),
-            "reported_tokens": {key: counts[key] for key in counts if key not in cache_fields},
-            "missing_usage": {key: missing[key] for key in missing if key not in cache_fields},
-            "reported_cache_tokens": {
-                key: counts[key] if missing[key] < len(events) + unreported else None
-                for key in cache_fields
-            },
-            "missing_cache_usage": {key: missing[key] for key in cache_fields},
-            "context_requests": requests,
-            "unreported_attempts": unreported,
-            "includes_summary_calls": False,
-        }
+        snapshots = ContextSnapshots(store, run_id).list(include_roles=True)
+        return summarize_usage(store.trace(run_id), snapshots)
 
     return app

@@ -6,6 +6,7 @@ import json
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
+from pydantic_core import PydanticCustomError
 
 from ..models import Identifier, Model
 from ..storage import Store
@@ -30,7 +31,9 @@ class MemoryHypothesis(Model):
     """
 
     claim: str = Field(min_length=1, max_length=2000)
-    assessment: Literal["supported", "refuted", "unverified"] = "unverified"
+    assessment: Literal["supported", "refuted", "unverified"] = Field(
+        default="unverified", description="supported 需要 support_ids，refuted 需要 contradict_ids。"
+    )
     # 支持与反对引用分开保存，并共同进入保护集合，不能因结论倾向而丢掉另一侧。
     support_ids: list[EvidenceID] = Field(default_factory=list)
     contradict_ids: list[EvidenceID] = Field(default_factory=list)
@@ -47,9 +50,17 @@ class MemoryHypothesis(Model):
                 MemoryHypothesis: 校验通过的当前记忆假设实例。
         """
         if self.assessment == "supported" and not self.support_ids:
-            raise ValueError("Supported memory hypothesis requires support_ids")
+            raise PydanticCustomError(
+                "hypothesis_evidence_required",
+                "Supported hypotheses need support_ids. Use unverified if evidence is missing.",
+                {"field": "support_ids"},
+            )
         if self.assessment == "refuted" and not self.contradict_ids:
-            raise ValueError("Refuted memory hypothesis requires contradict_ids")
+            raise PydanticCustomError(
+                "hypothesis_evidence_required",
+                "Refuted hypotheses need contradict_ids. Use unverified if evidence is missing.",
+                {"field": "contradict_ids"},
+            )
         return self
 
 
@@ -104,7 +115,7 @@ class MemoryStore:
                 None: 绑定已存在运行的记忆访问器，不立即创建记忆版本。
         """
         self.store, self.run_id = store, run_id
-        store.run(run_id)
+        self._incident_id = store.run_incident_id(run_id)
 
     def current(self):
         """
@@ -127,22 +138,25 @@ class MemoryStore:
             else {"version": 0, "memory": WorkingMemory().model_dump(), "protected_ids": []}
         )
 
-    def update(self, memory: WorkingMemory):
+    def update(self, memory: WorkingMemory, *, visible_evidence: set[str] | None = None):
         """
             校验当前应用和运行引用；任一非法引用使整次更新失败，不保存半份记忆。
 
             Args:
                 memory (WorkingMemory): 已经通过 Schema 校验的完整工作记忆，不是对旧版本的局部补丁。
+                visible_evidence: 调用角色可见的证据范围，为 None 时使用本次运行的完整范围。
 
             Returns:
                 dict: 新记忆版本、完整结构化记忆及累计保护引用。
         """
-        run = self.store.run(self.run_id)
-        incident = self.store.incident(run["incident_id"])
+        references = memory.references()
+        if visible_evidence is not None and not references <= visible_evidence:
+            raise ValueError("Memory cites evidence outside this agent's scope")
+        incident = self.store.incident(self._incident_id)
         contract = self.store.contract(incident["app_id"])
         if not set(memory.focus_components) <= set(contract["components"]):
             raise ValueError("Memory focus outside application contract")
-        if not memory.references() <= self.store.evidence_ids(self.run_id):
+        if not references <= self.store.evidence_ids(self.run_id):
             raise ValueError("Memory cites evidence outside this investigation")
         # 先验归属再保护，避免把其他运行的引用带入后续上下文或污染历史版本。
         protected = set(memory.critical_ids)

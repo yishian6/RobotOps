@@ -2,6 +2,7 @@
     G1 的可复现检查：检索适用范围、证据保真、请求协议及故障用量，不评测 LLM 智能。
 """
 
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from robotops_benchmarks.context import compare, protocol_valid
 from robotops.agent.client import DeepSeekClient
 from robotops.agent.context import ContextSnapshots, aggregate_logs, assemble, canonical
 from robotops.agent.memory import MemoryStore, WorkingMemory
+from robotops.agent.supervision import RoleScope
 from robotops.agent.workflow import investigate
 from robotops.api import create_app
 from robotops.config import Config
@@ -165,6 +167,59 @@ def test_memory_scope_and_monotonic_counter_evidence(investigation):
     other = store.start_run(next_incident["id"], "fixture")
     with pytest.raises(ValueError):
         MemoryStore(store, other).update(WorkingMemory(critical_ids=[counter]))
+
+
+def test_supervisor_can_only_write_memory_with_visible_evidence(investigation):
+    store, _, incident = investigation
+    run_id = store.start_run(incident["id"], "fixture")
+    visible = store.save_evidence(run_id, "query_metrics", {"status": "ok"})
+    unshared = store.save_evidence(run_id, "inspect_process", {"status": "ok"})
+    scope = RoleScope(ToolGateway(store, None, run_id), "supervisor", [visible])
+
+    denied = scope.execute("update_working_memory", {"critical_ids": [unshared]})
+    assert denied == {"status": "error", "error": "Memory cites evidence outside this agent's scope"}
+    assert MemoryStore(store, run_id).current()["version"] == 0
+
+    accepted = scope.execute("update_working_memory", {"critical_ids": [visible]})
+    assert accepted == {"status": "ok", "version": 1, "protected_ids": [visible]}
+    assert MemoryStore(store, run_id).current()["memory"]["critical_ids"] == [visible]
+
+
+def test_log_query_reuses_complete_scan_and_can_read_fresh_logs(investigation):
+    store, _, incident = investigation
+    run_id = store.start_run(incident["id"], "fixture")
+
+    class Observer:
+        app_id = "navigation"
+        calls = 0
+
+        def search_logs(self, keyword, limit, since):
+            self.calls += 1
+            return {"rows": [{"message": f"log-{self.calls}"}], "truncated": self.calls == 1}
+
+    observer = Observer()
+    gateway = ToolGateway(store, observer, run_id)
+    first = gateway.execute("search_logs", {})
+    assert first["data"]["truncated"]
+    complete = gateway.execute("search_logs", {})
+    previous = gateway.execute("search_logs", {"keyword": "error"})
+    assert previous["view"] == "previous_complete_log_scan"
+    assert previous["evidence_id"] == complete["evidence_id"]
+    assert previous["observed_at"] == complete["observed_at"]
+    assert observer.calls == len(store.evidence_ids(run_id)) == 2
+    assert "data" not in previous
+    assert gateway.execute("search_logs", {"refresh": True})["status"] == "error"
+    old_start = datetime.fromisoformat(complete["observed_at"]) - timedelta(seconds=1)
+    assert gateway.execute("search_logs", {"since": old_start.isoformat()}) == previous
+
+    scoped = gateway.execute("search_logs", {"keyword": "error"}, visible_evidence=set())
+    recent = gateway.execute("search_logs", {"since": complete["observed_at"]})
+    assert gateway.execute("search_logs", {"keyword": "processor"})["evidence_id"] == (
+        complete["evidence_id"]
+    )
+    assert observer.calls == len(store.evidence_ids(run_id)) == 4
+    assert scoped["data"]["rows"] == [{"message": "log-3"}]
+    assert recent["data"]["rows"] == [{"message": "log-4"}]
 
 
 def tool_turn(messages, number, name, result):
@@ -444,17 +499,37 @@ def test_snapshot_roundtrip_scope_and_integrity(investigation):
     store, _, incident = investigation
     run_id = store.start_run(incident["id"], "fixture")
     snapshots = ContextSnapshots(store, run_id)
-    original = [{"role": "user", "content": "原始请求"}]
-    sequence = snapshots.save(original, [], {}, {"strategy": "full"})
-    original[0]["content"] = "外部改写"
-    assert snapshots.get(sequence)["messages"][0]["content"] == "原始请求"
-    assert len(snapshots.list()) == 1
+    original = [{"role": "system", "content": "固定规则"}, {"role": "user", "content": "原始请求"}]
+    tools = [{"name": "shared_tool"}]
+    sequence = snapshots.save(original, tools, {}, {"strategy": "full"})
+    original[1]["content"] = "外部改写"
+    second = snapshots.save(original, tools, {}, {"strategy": "full"})
+    assert snapshots.get(sequence)["messages"][1]["content"] == "原始请求"
+    assert snapshots.get(second)["tools"] == tools
+    assert len(snapshots.list()) == 2
     with pytest.raises(KeyError):
-        snapshots.get(2)
+        snapshots.get(3)
+    assert snapshots.save(original, tools, {}, {"strategy": "full"}) == 3
     with store.connection() as db:
-        db.execute("UPDATE context_snapshots SET body='{}' WHERE run_id=?", (run_id,))
+        assert db.execute("SELECT count(*) FROM context_inputs").fetchone()[0] == 1
+        assert all("shared_tool" not in row[0] for row in db.execute("SELECT body FROM context_snapshots"))
+        assert db.execute("SELECT count(*) FROM context_messages").fetchone()[0] == 2
+        inline = json.loads(db.execute(
+            "SELECT body FROM context_snapshots WHERE run_id=? AND sequence=?", (run_id, second),
+        ).fetchone()[0])
+        inline.pop("message_ids")
+        inline["messages"] = original[1:]
+        db.execute("UPDATE context_snapshots SET body=? WHERE run_id=? AND sequence=?", (
+            canonical(inline), run_id, second,
+        ))
+    # 同一数据库内可读取旧的内联消息和新的消息引用。
+    assert snapshots.get(second)["messages"] == snapshots.get(3)["messages"] == original
+    with store.connection() as db:
+        key = hashlib.sha256(canonical(original[1]).encode()).hexdigest()
+        db.execute("UPDATE context_messages SET body='{}' WHERE sha256=?", (key,))
     with pytest.raises(ValueError, match="integrity"):
-        snapshots.get(sequence)
+        snapshots.get(3)
+    assert snapshots.get(second)["messages"] == original
 
 
 def test_workflow_uses_memory_and_context_beyond_framework_default(investigation):
@@ -484,6 +559,11 @@ def test_workflow_uses_memory_and_context_beyond_framework_default(investigation
         nonlocal evidence_id
         captured.append(messages)
         turn = len(captured)
+        if turn == 1:
+            names = {tool["function"]["name"] for tool in tools}
+            assert "get_application_contract" not in names
+            assert "update_working_memory" in names
+            assert json.loads(messages[1]["content"])["contract"]["app_id"] == "navigation"
         result = json.loads(messages[-1]["content"]) if messages[-1]["role"] == "tool" else {}
         # 第一轮先取得真实证据身份，第二轮才引用它写记忆，避免通过虚构 ID 绕开归属校验。
         if turn == 2:
@@ -516,13 +596,25 @@ def test_workflow_uses_memory_and_context_beyond_framework_default(investigation
         }
 
     # 17 轮超过框架默认节点上限；逐轮核对持久快照和实际输入，证明装配结果确实用于请求。
-    run = investigate(store, None, incident["id"], model, "fixture", context_strategy="evidence")
+    run = investigate(
+        store, None, incident["id"], model, "fixture", context_strategy="evidence", max_model_calls=17,
+    )
     assert run["state"] == "COMPLETED" and len(captured) == 17
     snapshots = ContextSnapshots(store, run["id"])
     assert len(snapshots.list()) == 17
     for index, outgoing in enumerate(captured, 1):
         assert snapshots.get(index)["messages"] == outgoing and protocol_valid(outgoing)
     assert snapshots.get(17)["memory"]["protected_ids"] == [evidence_id]
+    with store.connection() as db:
+        latest = json.loads(db.execute(
+            "SELECT body FROM context_snapshots WHERE run_id=? AND sequence=17", (run["id"],),
+        ).fetchone()[0])
+        assert latest["memory_version"] == 1
+        assert "memory" not in latest
+    events = store.trace(run["id"])
+    write = next(item for item in events if item.get("tool") == "update_working_memory")
+    assert write["arguments"]["critical_ids"] == [evidence_id]
+    assert write["result"] == {"status": "ok", "version": 1, "protected_ids": [evidence_id]}
     assert any(
         e["view"] == "duplicate_reference" for e in snapshots.get(17)["manifest"]["evidence"]
     )

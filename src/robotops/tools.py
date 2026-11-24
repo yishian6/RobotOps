@@ -3,10 +3,11 @@
 """
 
 from collections.abc import Collection
+from datetime import datetime
 
 from pydantic import AwareDatetime, Field, ValidationError
 
-from .agent.memory import MemoryStore, WorkingMemory
+from .agent.memory import EvidenceID, MemoryStore, WorkingMemory
 from .models import ApplicationContract, Identifier, Model, utc_now
 from .observations import ObservationSource, ObservationUnavailable
 from .retrieval import CaseLibrary
@@ -14,11 +15,7 @@ from .storage import Store
 
 
 class NoArgs(Model):
-    """
-        无参工具仍拒绝额外字段，防止调用者注入自选路径、应用或 PID。
-    """
-
-    pass
+    """无参工具仍拒绝额外字段，防止调用者注入自选路径、应用或 PID。"""
 
 
 class MetricArgs(Model):
@@ -46,8 +43,7 @@ class EvidenceArgs(Model):
         原文回取只接受平台生成的证据 ID，实际所属运行仍由 Store 校验。
     """
 
-    # 严格匹配平台的 ev- 加 32 位十六进制 ID；此处校验外形，存储层另验归属和哈希。
-    evidence_id: str = Field(pattern=r"^ev-[0-9a-f]{32}$")
+    evidence_id: EvidenceID
 
 
 class CaseArgs(Model):
@@ -67,17 +63,28 @@ TOOL_SPECS = {
     "inspect_process": (NoArgs, "检查受管组件的真实进程状态、启动实例、内存与遥测。"),
     "query_metrics": (
         MetricArgs,
-        "实际采样输入/输出速率、处理耗时与新鲜度；区别输入断流和处理停滞。",
+        "采样输入输出速率和新鲜度。in_flight_processing_age_ms 是未完成样本耗时，"
+        "last_completed_processing_latency_ms 是上次已完成样本耗时。接收为零时同时核对发送速率和在途耗时。",
     ),
-    "search_logs": (LogArgs, "在受管组件日志中按关键词和起始时间查询，返回来源及截断说明。"),
+    "search_logs": (
+        LogArgs,
+        "先查受管组件日志。完整结果已包含当时所有可读日志，无需再按关键词查同期。"
+        "确需查看后续日志时，用上次日志结果的 observed_at 作为 since。",
+    ),
     "get_recent_config_changes": (NoArgs, "读取受管应用的配置变更记录和当前配置版本。"),
-    "read_evidence": (EvidenceArgs, "按证据 ID 回取本次调查已经保存的原始观测。"),
+    "read_evidence": (
+        EvidenceArgs,
+        "按证据 ID 回取本次调查的原始观测。原始指标 processing_age_ms 指当前在途耗时，"
+        "processing_latency_ms 指上次已完成样本耗时。",
+    ),
     "retrieve_cases": (CaseArgs, "检索适用于当前应用版本/组件的已验证历史经验；不代表当前根因。"),
     "update_working_memory": (
         WorkingMemory,
-        "保存本次调查事实/假设/待查问题；支持和反对引用均保护原文。只修改调查记忆。",
+        "仅在后续还需多轮取证时保存事实、假设和待查问题；支持和反对引用均保护原文。"
+        "已经可以交报告时直接提交。成功回执只包含记忆版本和受保护引用。",
     ),
 }
+DIRECT_OBSERVATION_TOOLS = {"inspect_process", "query_metrics", "search_logs", "get_recent_config_changes"}
 
 
 def tool_definitions(allowed: Collection[str] | None = None) -> list[dict]:
@@ -105,6 +112,31 @@ def tool_definitions(allowed: Collection[str] | None = None) -> list[dict]:
     ]
 
 
+def invalid_arguments(message: str, error: ValidationError) -> dict:
+    """
+        给模型提供可修正的字段路径，不回显整份失败输入。
+
+        Args:
+            message: 工具使用的简短错误说明。
+            error: Pydantic 参数校验错误。
+
+        Returns:
+            dict: 工具错误及字段路径、错误类型和原因。
+    """
+    issues = []
+    for item in error.errors(include_input=False, include_url=False):
+        path = list(item["loc"])
+        kind = item["type"]
+        details = item["msg"]
+        if kind == "extra_forbidden" and path:
+            # 未声明的键也来自模型，避免把任意文本或整份参数回显到下一轮。
+            path[-1] = "<unexpected_field>"
+        if kind == "hypothesis_evidence_required":
+            path.append(item["ctx"]["field"])
+        issues.append({"path": path, "code": kind, "message": details})
+    return {"status": "error", "error": message, "validation_errors": issues}
+
+
 class ToolGateway:
     """
         将工具调用绑定到一个持久化运行记录，服务端据此确定应用范围。
@@ -126,10 +158,10 @@ class ToolGateway:
                 None: 固定当前运行、事件与观测依赖，不执行环境检查。
         """
         self.store, self.observer, self.run_id = store, observer, run_id
-        run = store.run(run_id)
-        self.incident = store.incident(run["incident_id"])
+        self.incident = store.incident(store.run_incident_id(run_id))
+        self._complete_log_scan: dict | None = None
 
-    def execute(self, name: str, arguments: dict):
+    def execute(self, name: str, arguments: dict, *, visible_evidence: set[str] | None = None):
         """
             返回统一工具结果，不以“未观测到数据”冒充“观测到正常或零速率”。
 
@@ -140,16 +172,23 @@ class ToolGateway:
             Args:
                 name (str): 注册表中的工具名；未知或禁止的名字以 error 结果返回。
                 arguments (dict): 对应工具的 JSON 参数对象；Schema、范围错误转换为 error，不扩大权限。
+                visible_evidence: 调用角色当前可读取和写入记忆的证据范围。
 
             Returns:
                 dict: 统一的 ok/error/unavailable 结果；观测结果附证据 ID 和原文引用。
         """
         if name not in TOOL_SPECS:
             return {"status": "error", "error": "Unknown or disallowed tool"}
+        if name == "read_evidence" and visible_evidence is not None:
+            evidence_id = arguments.get("evidence_id")
+            if not isinstance(evidence_id, str) or evidence_id not in visible_evidence:
+                return {"status": "error", "error": "Evidence is outside this agent's scope"}
         # 先完成入口校验再访问环境；拒绝未知字段，模型不能夹带路径、PID 或运行 ID。
         try:
             args = TOOL_SPECS[name][0].model_validate(arguments)
         except ValidationError as exc:
+            if name == "update_working_memory":
+                return invalid_arguments("Invalid working memory arguments", exc)
             return {"status": "error", "error": "Invalid tool arguments", "details": str(exc)}
         # 原文回取沿用原证据身份，不生成新的观测时间或 ID，避免把旧结果包装成最新实测。
         if name == "read_evidence":
@@ -160,13 +199,34 @@ class ToolGateway:
         # 工作记忆是模型注记而非环境观测，不为更新记忆本身生成能支撑根因的证据。
         if name == "update_working_memory":
             try:
-                return {"status": "ok", **MemoryStore(self.store, self.run_id).update(args)}
+                memory = MemoryStore(self.store, self.run_id)
+                saved = memory.update(args, visible_evidence=visible_evidence)
+                return {
+                    "status": "ok", "version": saved["version"],
+                    "protected_ids": saved["protected_ids"],
+                }
             except ValueError as exc:
                 return {"status": "error", "error": str(exc)}
+        cached = self._complete_log_scan
+        if (
+            name == "search_logs" and cached is not None
+            and (visible_evidence is None or cached["evidence_id"] in visible_evidence)
+            and (args.since is None or args.since < datetime.fromisoformat(cached["observed_at"]))
+        ):
+            return {
+                **cached, "view": "previous_complete_log_scan",
+                "note": "此前完整日志已覆盖当时的数据。本次未重新读取。"
+                "通过 read_evidence 查看原文。确需后续日志时用该 observed_at 作为 since。",
+            }
         observed_at = utc_now()
         try:
             if name == "get_application_contract":
                 data = self.store.contract(self.incident["app_id"])
+            elif name == "search_logs" and "execution_exit" in self.incident:
+                # 事件绑定到失败的那次启动，后续重启的同名进程不会替换这份现场记录。
+                data = self.store.execution_logs(
+                    self.incident["id"], args.keyword, args.limit, args.since,
+                )
             elif name == "retrieve_cases":
                 try:
                     contract = self.store.contract(self.incident["app_id"])
@@ -201,7 +261,15 @@ class ToolGateway:
             raw = {"status": "unavailable", "observed_at": observed_at, "error": str(exc)}
         # 不可用观测也要保留依据；但证据写入失败不能冒充工具成功，因此不在这里吞掉持久化错误。
         evidence_id = self.store.save_evidence(self.run_id, name, raw)
-        return {**raw, "evidence_id": evidence_id, "raw_uri": f"evidence:{evidence_id}"}
+        reference = {"evidence_id": evidence_id, "raw_uri": f"evidence:{evidence_id}"}
+        if (
+            name == "search_logs" and raw["status"] == "ok"
+            and args.since is None and not args.keyword
+            and data.get("truncated") is False
+            and not data.get("malformed_lines") and not data.get("incomplete_tail")
+        ):
+            self._complete_log_scan = {"status": "ok", "observed_at": observed_at, **reference}
+        return {**raw, **reference}
 
     def _observe(self, name, args):
         """
