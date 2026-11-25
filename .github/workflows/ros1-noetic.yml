@@ -1,0 +1,43 @@
+name: ROS 1 Noetic regression
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  noetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.9"
+      - name: Build collector and run all tests
+        run: |
+          docker run --rm -i \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --volume "$(command -v uv):/usr/local/bin/uv:ro" \
+            --workdir /workspace ros:noetic-ros-base-focal bash -s <<'NOETIC'
+          set -eo pipefail
+          # ROS is already installed in the image. The build tools come from Ubuntu.
+          apt-get -o Dir::Etc::sourceparts=- update
+          apt-get -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
+            build-essential cmake libsqlite3-dev nlohmann-json3-dev
+          uv sync --locked --extra dev
+          source /opt/ros/noetic/setup.bash
+          cmake -S cpp/ros1_facts -B build/ros1_facts -DPYTHON_EXECUTABLE=/usr/bin/python3
+          cmake --build build/ros1_facts --parallel 2
+          export ROBOTOPS_ROS1_FACTS_BIN="$PWD/build/ros1_facts/robotops_ros1_facts"
+          test -x "$ROBOTOPS_ROS1_FACTS_BIN"
+          uv run --no-sync pytest -q -rs --junitxml=/tmp/robotops-tests.xml
+          /usr/bin/python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          if ET.parse("/tmp/robotops-tests.xml").findall(".//skipped"):
+              raise SystemExit("The Noetic regression requires zero skipped tests.")
+          PY
+          NOETIC

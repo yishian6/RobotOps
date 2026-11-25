@@ -32,7 +32,7 @@ def _observation_signatures(tool: str, data: dict | None) -> set[bytes]:
         return set()
     if tool == "search_logs":
         scope = (data.get("source"), data.get("runtime_id"), data.get("process_name"))
-        records = [(scope, row) for row in data.get("rows") or data.get("lines") or ()]
+        records = [(scope, row) for row in data.get("rows") or data.get("lines") or data.get("logs") or ()]
     elif tool == "retrieve_cases":
         records = data.get("cases") or ()
     elif tool == "get_recent_config_changes" and "changes" in data:
@@ -96,7 +96,13 @@ class InvestigationRecovery:
                 for key in ("support_ids", "contradict_ids") for evidence_id in finding.get(key, [])
             })
         elif tool == "read_evidence":
-            signatures = _evidence_signatures(result)
+            if result.get("view") in {"evidence_page", "evidence_fields"}:
+                # Paging or selecting columns cannot turn an already known observation into progress.
+                signatures = self._referenced_signatures([result["id"]])
+            else:
+                signatures = _evidence_signatures(result)
+        elif tool == "search_logs" and result.get("view") == "log_preview":
+            signatures = self._referenced_signatures([result["evidence_id"]])
         else:
             signatures = _observation_signatures(tool, result.get("data"))
         new = not signatures.issubset(self.observations)

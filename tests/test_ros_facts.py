@@ -406,6 +406,7 @@ while not rospy.is_shutdown():
             assert process.wait(timeout=25) == 17, (tmp_path / "runner.log").read_text()
             events = [store.incident(row["id"]) for row in store.incidents()]
             original, = [event for event in events if "launch_restart" in event]
+            assert original["state"] == "OPEN"
             assert original["launch_restart"]["state"] == "FAILED"
             acceptance = original["launch_restart"]["topic_acceptance"]
             assert acceptance["state"] == "FAILED"
@@ -451,7 +452,9 @@ while not rospy.is_shutdown():
                         else:
                             assert acceptance["reason"] == "no_fresh_messages"
                             assert observation["messages_observed"] == 0
-                assert store.incident(event["id"])["launch_restart"]["state"] == "STABLE"
+                current = store.incident(event["id"])
+                assert current["launch_restart"]["state"] == "STABLE"
+                assert current["state"] == ("RESOLVED" if scenario == "continuous" else "OPEN")
             stop_process(process)
             assert len(store.incidents()) == 1
         with store.connection() as db:

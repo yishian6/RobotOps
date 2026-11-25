@@ -7,6 +7,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 DEFAULT_COMPACT_AFTER_TOKENS = 128 * 1024
@@ -20,6 +21,7 @@ class ContextWindow:
     compact_after_tokens: int = DEFAULT_COMPACT_AFTER_TOKENS
     total_tokens: int | None = None
     output_tokens: int | None = None
+    estimator: Literal["byte_upper_estimate", "deepseek_flash_calibrated"] = "byte_upper_estimate"
 
     def __post_init__(self):
         if type(self.compact_after_tokens) is not int or self.compact_after_tokens < 1:
@@ -130,6 +132,8 @@ class Config:
         object.__setattr__(self, "context_window", ContextWindow(
             compact_after_tokens=self.context_compact_after_tokens,
             total_tokens=total, output_tokens=output,
+            estimator="deepseek_flash_calibrated" if official_deepseek
+            and self.model in {"deepseek-flash", "deepseek-v4-flash"} else "byte_upper_estimate",
         ))
 
     @classmethod

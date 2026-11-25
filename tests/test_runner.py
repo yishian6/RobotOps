@@ -14,6 +14,37 @@ from robotops.config import Config
 from robotops.storage import Store
 
 
+def test_topic_acceptance_closes_only_the_original_incident(tmp_path):
+    store = Store(tmp_path)
+    store.start_execution("camera", "old-execution")
+    original = store.record_execution_exit("old-execution", "roslaunch", 17, 0)
+    other = store.record_execution_exit("old-execution", "another-node", 19, 0)
+    store.start_execution(
+        "camera", "new-execution", restart_of=original,
+        topic_acceptance={"state": "PENDING", "topic": "/camera/output"},
+    )
+    run = store.start_run(original, "fixture")
+    passed = {"state": "PASSED", "topic": "/camera/output"}
+    store.finish_topic_acceptance("new-execution", passed)
+    assert store.incident(original)["launch_restart"]["topic_acceptance"]["state"] == "PENDING"
+
+    store.finish_launch_restart("new-execution", "STABLE")
+    assert store.incident(original)["state"] == "INVESTIGATING"
+    store.finish_topic_acceptance("new-execution", passed)
+    store.finish_topic_acceptance("new-execution", {"state": "FAILED"})
+    event = store.incident(original)
+    assert event["state"] == "RESOLVED"
+    assert event["launch_restart"]["topic_acceptance"]["state"] == "PASSED"
+    assert store.incident(other)["state"] == "OPEN"
+
+    store.finish_run(run, error="A late investigation failed")
+    follow_up = store.start_run(original, "fixture")
+    assert store.incident(original)["state"] == "RESOLVED"
+    store.finish_run(follow_up, report={"status": "proposed"})
+    assert store.run(follow_up)["state"] == "COMPLETED"
+    assert store.incident(original)["state"] == "RESOLVED"
+
+
 def test_console_exit_is_available_to_investigation(tmp_path):
     """
         验证终端输出、退出事件和调查报告引用同一次运行，正常退出不新建事件。

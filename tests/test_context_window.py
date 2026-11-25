@@ -6,10 +6,13 @@ import pytest
 from robotops.agent.client import DeepSeekClient
 from robotops.agent.context import ContextSnapshots, assemble, canonical, fit_context_window
 from robotops.agent.memory import WorkingMemory
+from robotops.agent.recovery import InvestigationRecovery
+from robotops.agent.usage import summarize_usage
 from robotops.agent.workflow import investigate
 from robotops.config import Config, ContextWindow
 from robotops.models import ApplicationContract, IncidentCreate
 from robotops.storage import Store
+from robotops.tools import ToolGateway
 
 
 def submit(evidence_ids=()):
@@ -39,7 +42,7 @@ def test_sdk_long_investigation_keeps_tool_pairs_and_retrievable_evidence(tmp_pa
             }
 
     config = Config(
-        api_key="fixture", context_compact_after_tokens=14952,
+        api_key="fixture", context_compact_after_tokens=8000,
         context_window_tokens=17000, model_output_tokens=2048,
     )
     store = Store(tmp_path)
@@ -93,6 +96,7 @@ def test_sdk_long_investigation_keeps_tool_pairs_and_retrievable_evidence(tmp_pa
     windows = [snapshots.get(index)["manifest"]["context_window"] for index in range(1, 8)]
     assert windows[0]["stage"] == "unchanged"
     assert windows[2]["stage"] == "tool_references"
+    assert windows[2]["stages"][0] == "assistant_notes"
     assert windows[2]["remaining_estimated_tokens"] > 2000
     assert windows[3]["remaining_estimated_tokens"] > 2000
     assert all(item["fits"] and item["after_estimated_tokens"] <= 14952 for item in windows)
@@ -104,7 +108,7 @@ def test_sdk_long_investigation_keeps_tool_pairs_and_retrievable_evidence(tmp_pa
     assert len(store.read_evidence(run["id"], references[1])["raw"]["data"]["lines"]) == 110
 
 
-@pytest.mark.parametrize("input_limit, expected_requests", [(5500, 1), (500, 0)])
+@pytest.mark.parametrize("input_limit, expected_requests", [(6000, 1), (500, 0)])
 def test_context_window_switches_to_report_only_or_finishes_locally(
     tmp_path, input_limit, expected_requests,
 ):
@@ -142,7 +146,7 @@ def test_context_window_uses_configuration_overrides(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ROBOTOPS_CONFIG", str(path))
     monkeypatch.setenv("ROBOTOPS_MODEL_OUTPUT_TOKENS", "2048")
-    assert Config.load().context_window == ContextWindow(12000, 32768, 2048)
+    assert Config.load().context_window == ContextWindow(12000, 32768, 2048, "deepseek_flash_calibrated")
     with pytest.raises(ValueError, match="larger than its output limit"):
         Config(context_window_tokens=100, model_output_tokens=100)
 
@@ -195,7 +199,7 @@ def test_input_threshold_is_independent_of_generation_limit(output_override):
     assert window.compact_after_tokens == 131072
     assert window.input_limit_tokens == 1048576 - (output_override or 8192)
     memory = {"version": 0, "protected_ids": [], "memory": WorkingMemory().model_dump()}
-    for size, compaction_attempted in ((110000, False), (140000, True)):
+    for size, compaction_attempted in ((250000, False), (270000, True)):
         history = [{"role": "system", "content": "保持只读"}, {"role": "user", "content": "x" * size}]
         outgoing, manifest = assemble(history, memory)
         fitted, audit = fit_context_window(history, outgoing, [], memory, manifest, window)
@@ -267,3 +271,123 @@ def test_window_retains_diagnostic_facts_and_prioritizes_explicit_evidence_reads
     reduced = json.loads(compacted[-1]["content"])
     assert reduced["evidence_id"] == metrics_id and reduced["data"]["rates"] == rates
     assert "note" in reduced
+
+
+def test_evidence_pages_keep_source_rows_and_do_not_reset_progress(tmp_path):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    incident = store.create_incident(IncidentCreate(app_id="camera", symptom="输出停滞"))
+    run_id = store.start_run(incident["id"], "fixture")
+    rows = [
+        {"at": "2026-11-25T00:00:00Z", "component": "camera", "sample": index, "detail": "x" * 20000}
+        for index in range(30)
+    ]
+    data = {"rows": rows, "truncated": False}
+
+    class Logs:
+        app_id = "camera"
+
+        def search_logs(self, keyword, limit, since):
+            return data
+
+    gateway = ToolGateway(store, Logs(), run_id)
+    preview = gateway.execute("search_logs", {"limit": 30})
+    assert preview["view"] == "log_preview"
+    assert preview["page"] == {
+        "offset": 29, "total": 30, "returned": 1, "next_offset": None, "omitted_rows": [29],
+    }
+    assert preview["data"]["rows"] == [{"at": rows[-1]["at"], "component": "camera"}]
+    evidence_id = preview["evidence_id"]
+    args = {"evidence_id": evidence_id}
+    first = gateway.execute("read_evidence", args)
+    assert first["page"]["next_offset"] == 1 and first["page"]["omitted_rows"] == [0]
+    assert first["raw"]["data"]["rows"] == [{"at": rows[0]["at"], "component": "camera"}]
+    last = gateway.execute("read_evidence", {**args, "offset": 20, "fields": ["sample"]})
+    assert last["page"]["next_offset"] is None
+    assert [row["sample"] for row in last["raw"]["data"]["rows"]] == list(range(20, 30))
+    assert store.read_evidence(run_id, evidence_id)["raw"]["data"] == data
+    assert first["id"] == last["id"] == evidence_id and first["sha256"] == last["sha256"]
+    assert gateway.execute("read_evidence", args, visible_evidence=set())["status"] == "error"
+    recovery = InvestigationRecovery(lambda key: store.read_evidence(run_id, key))
+    assert recovery.record_progress("search_logs", preview)
+    assert not recovery.record_progress("read_evidence", last)
+
+
+def test_window_drops_duplicate_replies_before_assistant_notes():
+    memory = {"version": 0, "protected_ids": [], "memory": WorkingMemory().model_dump()}
+    history = [{"role": "system", "content": "只读"}, {"role": "user", "content": "查相机"}]
+    body = canonical({"evidence_id": "ev-" + "1" * 32, "data": {"line": "x" * 5000}})
+    for index in range(3):
+        key = f"tool-{index}"
+        history += [
+            {"role": "assistant", "content": "保留诊断计划", "tool_calls": [{
+                "id": key, "type": "function",
+                "function": {"name": "search_logs", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": key, "content": body if index < 2 else "{}"},
+        ]
+    outgoing, manifest = assemble(history, memory, "full")
+    fitted, audit = fit_context_window(
+        history, outgoing, [], memory, manifest, ContextWindow(8000),
+    )
+    assert audit["stages"] == ["duplicate_history"]
+    assert fitted[:2] == history[:2]
+    assert fitted[4] == history[4] and fitted[6:] == history[6:]
+    assert json.loads(fitted[5]["content"])["view"] == "duplicate_reference"
+
+
+def test_memory_view_bounds_model_input_and_preserves_both_sides():
+    support, counter = ("ev-" + digit * 32 for digit in ("1", "2"))
+    memory = WorkingMemory(
+        phase="verification",
+        hypotheses=[{"claim": "可疑组件", "support_ids": [support], "contradict_ids": [counter]}],
+        facts=[{"statement": "x" * 2000, "evidence_ids": [support]} for _ in range(12)],
+    ).model_dump()
+    snapshot = {"version": 1, "protected_ids": [support, counter], "memory": memory}
+    history = [
+        {"role": "system", "content": "只读"}, {"role": "user", "content": "查相机"},
+        {"role": "assistant", "content": "目前缺少可验证的现场结果。"},
+    ]
+    outgoing, _ = assemble(history, snapshot, "rolling")
+    selected = json.loads(outgoing[2]["content"])["memory"]
+    assert len(canonical(selected).encode()) <= 8192
+    assert selected["memory"]["hypotheses"] == memory["hypotheses"]
+    assert selected["omitted"]["facts"] == 12 - len(selected["memory"]["facts"])
+    assert len(memory["facts"]) == 12
+
+
+@pytest.mark.parametrize("limit, success", [(2, True), (1, False)])
+def test_provider_context_rejection_retries_once_with_a_smaller_report_request(tmp_path, limit, success):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    incident = store.create_incident(IncidentCreate(app_id="camera", symptom="输出停滞"))
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(400, json={"error": {
+                "code": "context_length_exceeded", "message": "Maximum context length exceeded",
+            }})
+        return httpx.Response(200, json={"choices": [{"message": submit()}], "usage": {
+            "prompt_tokens": 300, "completion_tokens": 20, "prompt_cache_hit_tokens": 100,
+        }})
+
+    config = Config(api_key="fixture")
+    client = DeepSeekClient(config, transport=httpx.MockTransport(handler))
+    run = investigate(
+        store, None, incident["id"], client.complete, config.model,
+        context_window=config.context_window, max_model_calls=limit,
+    )
+    assert run["state"] == "COMPLETED" and run["report"]["status"] == "needs_human"
+    events = store.trace(run["id"])
+    snapshots = ContextSnapshots(store, run["id"])
+    usage = summarize_usage(events, snapshots.list(include_roles=True))["context_window"]
+    assert usage["provider_rejections"] == 1 and usage["provider_retries"] == int(success)
+    assert len(requests) == limit
+    if success:
+        first, last = usage["requests"]
+        assert last["after_estimated_tokens"] < first["after_estimated_tokens"]
+        assert last["actual_prompt_tokens"] == 300 and last["prompt_cache_hit_tokens"] == 100
+        assert requests[1]["messages"] == requests[0]["messages"]
+        assert [item["function"]["name"] for item in requests[1]["tools"]] == ["submit_report"]

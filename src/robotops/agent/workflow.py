@@ -1,5 +1,7 @@
 """建立只读调查、校验诊断报告并保存运行结果。"""
 
+import re
+from datetime import datetime
 from functools import partial
 from typing import Literal, get_args
 
@@ -27,6 +29,54 @@ _REPORT_INSTRUCTION = (
     "能说明故障现象、范围和下一步时，跳过记忆更新，直接通过 submit_report 提交。"
     "未证实的机制列为待查。"
 )
+_FIRST_SAMPLE_STALL = re.compile(
+    r"(?:首[个次条]|第一[个次条])(?:处理)?(?:输入|样本|消息)"
+    r"[^，。；！？\n]{0,8}(?:卡住|卡死|阻塞|挂起|停滞|未完成)"
+    r"|\bfirst (?:input|sample|message)\b[^.!?\n]{0,30}"
+    r"\b(?:got stuck|hung|blocked|stalled|never finished)\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_stall_timing(report: DiagnosticReport, observations: dict[str, dict]) -> None:
+    """Reject a first-sample stall claim when the same component had completed earlier work."""
+    target = report.recommended_action.target
+    if not target:
+        return
+    claims = [report.summary, *(h.cause for h in report.hypotheses if h.assessment == "supported")]
+    assertions = (
+        clause for claim in claims for clause in re.split(r"[。；;！!？?\n]", claim)
+        if not re.search(r"并非|不是|排除|无法判断|不能断言|不确定|是否|\bnot\b|\bwhether\b", clause)
+    )
+    if not any(_FIRST_SAMPLE_STALL.search(clause) for clause in assertions):
+        return
+    for observation in observations.values():
+        raw = observation["raw"]
+        if observation["tool"] not in {"query_metrics", "inspect_process"} or raw.get("status") != "ok":
+            continue
+        data = raw.get("data")
+        snapshot = data.get("current", data) if isinstance(data, dict) else None
+        components = snapshot.get("components") if isinstance(snapshot, dict) else None
+        if not isinstance(components, dict):
+            continue
+        component = components.get(target)
+        telemetry = component.get("telemetry") if isinstance(component, dict) else None
+        if not isinstance(telemetry, dict):
+            continue
+        count = telemetry.get("processed_count")
+        if type(count) is not int or count <= 0:
+            continue
+        try:
+            completed = datetime.fromisoformat(telemetry["last_output_at"])
+            started = datetime.fromisoformat(telemetry["processing_started_at"])
+            earlier_completion = completed < started
+        except (KeyError, TypeError, ValueError):
+            continue
+        if earlier_completion:
+            raise ModelError(
+                f"{target} 已完成 {count} 个样本，且上次输出早于当前在途样本。"
+                "请改为描述在途样本自观测时间起未完成，以及未验证的阻塞点。"
+            )
 
 
 def _validate_report(
@@ -49,20 +99,21 @@ def _validate_report(
     if required_evidence_id is not None and required_evidence_id not in references:
         raise ModelError("The report must cite the original ROS Topic observation")
 
-    # 先读取全部引用，确保假设所依赖的原文均通过完整性校验。
+    # Load each cited source once for both the existing evidence checks and timing checks.
+    observations = {eid: store.read_evidence(run_id, eid) for eid in references}
     for hypothesis in validated.hypotheses:
         if hypothesis.assessment == "unverified":
             continue
-        observations = [store.read_evidence(run_id, eid) for eid in hypothesis.evidence_ids]
         if not any(
             item["tool"] not in {"retrieve_cases", "get_application_contract"}
             and item["raw"].get("status") == "ok"
-            for item in observations
+            for item in (observations[eid] for eid in hypothesis.evidence_ids)
         ):
             raise ModelError("A confirmed hypothesis requires current observation evidence")
     target = validated.recommended_action.target
     if target and target not in components:
         raise ModelError("Model suggested a target outside the application contract")
+    _validate_stall_timing(validated, observations)
     return validated.model_dump(mode="json")
 
 

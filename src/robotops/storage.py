@@ -493,13 +493,21 @@ class Store:
             )
 
     def finish_topic_acceptance(self, execution_id: str, result: dict) -> None:
-        """Keep one final observation on the existing restart receipt."""
+        """Persist the Topic verdict and close the linked incident on a stable, accepted restart."""
         with self.connection() as db:
-            db.execute(
+            updated = db.execute(
                 "UPDATE launch_restarts SET topic_acceptance=? WHERE execution_id=? "
-                "AND json_extract(topic_acceptance, '$.state')='PENDING'",
-                (json.dumps({**result, "checked_at": utc_now()}, allow_nan=False), execution_id),
+                "AND json_extract(topic_acceptance, '$.state')='PENDING' "
+                "AND (? != 'PASSED' OR state='STABLE')",
+                (json.dumps({**result, "checked_at": utc_now()}, allow_nan=False),
+                 execution_id, result["state"]),
             )
+            if updated.rowcount and result["state"] == "PASSED":
+                db.execute(
+                    "UPDATE incidents SET state='RESOLVED' WHERE id=("
+                    "SELECT incident_id FROM launch_restarts WHERE execution_id=?)",
+                    (execution_id,),
+                )
 
     def finish_execution(self, execution_id: str, returncode: int) -> None:
         """
@@ -612,6 +620,8 @@ class Store:
                 dict: 事件详情及当前业务状态。
         """
         with self.connection() as db:
+            # The incident state and its acceptance receipt must come from one SQLite snapshot.
+            db.execute("BEGIN")
             row = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
             if row is None:
                 raise KeyError("Incident not found")
@@ -681,7 +691,7 @@ class Store:
 
     def start_run(self, incident_id: str, model: str, *, automatic: bool = False):
         """
-            同一事务创建 RUNNING 记录并将事件改为 INVESTIGATING，返回运行 ID。
+            同一事务创建 RUNNING 记录并将未解决事件改为 INVESTIGATING，返回运行 ID。
 
             同一事件的并发请求由唯一索引裁决，自动任务在同一事务认领。
 
@@ -714,7 +724,10 @@ class Store:
                 if claimed.rowcount != 1:
                     raise ConflictError("Automatic investigation task already claimed or missing")
             # 和运行插入同事务提交；插入冲突时回滚，事件不会被误标为调查中。
-            db.execute("UPDATE incidents SET state='INVESTIGATING' WHERE id=?", (incident_id,))
+            db.execute(
+                "UPDATE incidents SET state='INVESTIGATING' WHERE id=? AND state!='RESOLVED'",
+                (incident_id,),
+            )
         return run_id
 
     def finish_run(self, run_id: str, report=None, error: str | None = None):
@@ -722,7 +735,7 @@ class Store:
             提交调查结果，同时更新运行记录和所属事件的业务状态。
 
             有 error 时运行为 FAILED，否则为 COMPLETED；报告为 proposed 时事件
-            标为 PROPOSED，其余情况为 NEEDS_HUMAN。调用者负责在进入此方法前校验报告。
+            标为 PROPOSED，其余情况为 NEEDS_HUMAN。已解决的事件保持 RESOLVED。
             只有 RUNNING 可以转换为终态；并发或迟到的结束请求不能覆盖旧结果及新调查状态。
 
             Args:
@@ -733,7 +746,7 @@ class Store:
             Returns:
                 None: 原子更新运行终态与关联事件状态，不宣告故障恢复。
         """
-        # 调查完成只代表得到报告；G0 无独立恢复验收，事件永远不在此转为已解决。
+        # 诊断结论独立落盘，同时尊重业务验收已确认的恢复状态。
         incident_id = self.run_incident_id(run_id)
         # 按 None 判断“恰好一个结果”，避免空字典或空文本的真假值掩盖调用方的互斥参数错误。
         if (report is None) == (error is None):
@@ -752,7 +765,8 @@ class Store:
             if updated.rowcount != 1:
                 raise ConflictError("Investigation already finished")
             db.execute(
-                "UPDATE incidents SET state=? WHERE id=?", (incident_state, incident_id)
+                "UPDATE incidents SET state=? WHERE id=? AND state!='RESOLVED'",
+                (incident_state, incident_id),
             )
 
     def run_incident_id(self, run_id: str) -> str:

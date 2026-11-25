@@ -118,6 +118,8 @@ robotops run --restart-on-exit --verify-topic /camera/image_raw \
 
 在同一事件的 `launch_restart.topic_acceptance` 查看结果。运行中为 `PENDING`。通过为 `PASSED`，超时或观察期间 launch 退出为 `FAILED`，主动停止为 `INTERRUPTED`，采集器无法提供有效观测为 `UNAVAILABLE`。回执在获得观测后保留发布节点、时间、观测消息数、连续窗口长度和最大消息间隔。该检查面向持续更新的业务输出，验证的是 Topic 数据到达情况。Topic 停发且 launch 仍在线时，走下方的自动调查。
 
+业务验收 `PASSED` 时，RobotOps 在写回执的同一事务中把原退出事件置为 `RESOLVED`。进程已启动、业务验收失败、中断或不可用时，事件沿用原有状态。原事件和日志仍可查询，也可继续做只读调查。 [事件与验收写入](src/robotops/storage.py)
+
 ## 监测已有 Linux 服务
 
 分别启动核心 API 和监测进程。两者使用同一个数据目录。
@@ -233,7 +235,7 @@ curl -sS -X POST "http://127.0.0.1:8000/incidents/${INCIDENT_ID}/investigate"
 | `GET /runs/{id}/evidence/{evidence_id}` | 原始证据与完整性校验信息 |
 | `GET /runs/{id}/memory` | 工作记忆和受保护的证据引用 |
 | `GET /runs/{id}/contexts`、`GET /runs/{id}/contexts/{sequence}` | 快照索引，或按轨迹中的 `context_sequence` 查对应模型输入 |
-| `GET /runs/{id}/usage` | 整次调查和 `by_role` 下的分角色请求数、实报 Token、缓存与缺失用量 |
+| `GET /runs/{id}/usage` | 整次调查和分角色的实报 Token、缓存与缺失用量，以及上下文裁剪、估算误差和重试 |
 
 其他故障模式包括 `input_stopped`、`config_mismatch` 和 `processor_exit`。演示结束后执行 `curl -sS -X DELETE http://127.0.0.1:8000/demo` 清理本地子进程，已保存的调查记录仍可查询。
 
@@ -260,7 +262,7 @@ curl -sS -X POST "http://127.0.0.1:8000/incidents/${INCIDENT_ID}/investigate"
 
 两种模式共用调查模板，层级式另外加载主 Agent 和子 Agent 的角色提示词。模板与角色资源分别记录版本和内容指纹。[提示词资源](config/prompts/) · [层级式角色提示词](config/prompts/supervision/v1/roles.json)
 
-每次发送前，RobotOps 估算消息和工具 Schema 占用。超过 131,072 的默认输入阈值时，逐级整理旧历史和较大的工具正文，保留系统指令、用户任务、工作记忆和最近一批成对的工具消息。只在超过模型可用输入上限时，才进入只提交报告或本地人工复核收尾。生成上限默认采用服务端配置。[窗口计量与回查](doc/RobotOps_上下文管理.md#6-m5-请求前的窗口裁剪)
+每轮发送前，RobotOps 估算消息和工具 Schema 占用。官方 DeepSeek Flash 使用实报校准，默认超过 131,072 输入 Token 时依次整理重复记录、助手笔记和大工具结果。大型日志查询先返回最近一页。日志回读支持分页和字段选择，运行证据接口可查完整原文。预检超限或供应商拒绝时可缩小为报告请求。生成上限默认由服务端决定。 [窗口计量与回查](doc/RobotOps_上下文管理.md#6-m5-请求前的窗口裁剪)
 
 ## 项目结构
 
@@ -307,6 +309,8 @@ uv run python -m robotops_benchmarks.e2e --plan \
 ```
 
 ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但停发 → C++ 保存事实 → Python 自动调查 → 证据回查」，还验证重启后的持续输出、间歇输出、锁存回放和错误 Topic。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。0.4.0 曾用 DeepSeek Flash 实测启动回放，3 次请求交付一份引用原始 Topic 证据的报告，实报输入 7,405 Token、输出 2,177 Token。 [实测记录](doc/RobotOps_当前版本汇报.md#040-自动-topic-实测)
+
+发布回归要求在已加载 Noetic 且设置 `ROBOTOPS_ROS1_FACTS_BIN` 的环境运行全套 `pytest -q -rs`，汇报通过、失败和跳过数。GitHub Actions 的可选 **ROS 1 Noetic regression** 工作流在 Noetic 容器内构建采集器并跑全套，有跳过项即失败。工作流合入默认分支后可手动触发。 [Noetic 工作流](.github/workflows/ros1-noetic.yml) · [GitHub 手动触发规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
 
 上下文实验对照完整历史、滚动摘录和证据感知装配，记录 UTF-8 输入字节数、关键值保留和工具协议检查结果。真实模型费用需要另行对照实报输入、输出和缓存 Token。
 
