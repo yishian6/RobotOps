@@ -5,7 +5,7 @@
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from fastapi.testclient import TestClient
@@ -146,47 +146,29 @@ def test_concurrent_failed_observations_share_one_incident(tmp_path):
     assert store.incident(incident["id"])["service_exit"]["occurrences"] == 1
 
 
-def test_monitor_records_one_recovery_action_for_the_selected_service(tmp_path):
+def test_monitor_preserves_legacy_action_without_creating_new_ones(tmp_path):
     store = Store(tmp_path)
     target = store.register_service(
-        ServiceRegistration(unit=UNIT, scope="user"),
-        sample("running", instance_id="before"),
-    )
-    other_unit = "other.service"
-    other = store.register_service(
-        ServiceRegistration(unit=other_unit), sample("running", unit=other_unit),
+        ServiceRegistration(unit=UNIT, scope="user"), sample("running", instance_id="before"),
     )
     manager = Mock(spec=SystemdServiceManager)
-    offset = 1
-
-    def failed_reading(request):
-        return sample("failed", offset, unit=request.unit, result="exit-code")
-
-    manager.inspect.side_effect = failed_reading
-    rows = poll_services(store, manager, plan_recovery_for=target["app_id"])
-    incidents = {row["app_id"]: row["incident_id"] for row in rows}
-    incident_id = incidents[target["app_id"]]
-    action = store.incident(incident_id)["recovery_action"]
-    assert action["kind"] == "restart_service"
-    assert action["state"] == "AWAITING_AUTHORIZATION"
-    assert action["unit"] == UNIT and action["scope"] == "user"
-    assert action["config_version"] == target["config_version"]
-    assert action["failed_instance_id"] == "before"
-    assert action["basis"] == failed_reading(ServiceRegistration(unit=UNIT)).model_dump(mode="json")
-    assert "recovery_action" not in store.incident(incidents[other["app_id"]])
-    assert "restart" not in [call[0] for call in manager.method_calls]
-
-    offset = 2
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        checks = [
-            executor.submit(poll_services, Store(tmp_path), manager, plan_recovery_for=target["app_id"])
-            for _ in range(2)
-        ]
-        assert all(not row["created"] for check in checks for row in check.result())
-    reloaded = Store(tmp_path)
-    assert reloaded.incident(incident_id)["recovery_action"] == action
-    assert reloaded.incident(incident_id)["state"] == "OPEN"
-    with reloaded.connection() as db:
+    manager.inspect.return_value = sample("failed", 1, result="exit-code")
+    result, = poll_services(store, manager)
+    incident_id = result["incident_id"]
+    assert result["created"] and "recovery_action" not in store.incident(incident_id)
+    with store.connection() as db:
+        db.execute(
+            "INSERT INTO recovery_actions VALUES "
+            "('legacy-action', ?, 'restart_service', 'AWAITING_AUTHORIZATION', ?, "
+            "'user', ?, 'before', '{}', '2026-01-01T00:00:00+00:00')",
+            (incident_id, UNIT, target["config_version"]),
+        )
+    manager.inspect.return_value = sample("failed", 2, result="exit-code")
+    repeat, = poll_services(store, manager)
+    assert not repeat["created"] and repeat["incident_id"] == incident_id
+    assert store.incident(incident_id)["recovery_action"]["id"] == "legacy-action"
+    assert manager.method_calls == [call.inspect(ServiceRegistration(unit=UNIT, scope="user"))] * 2
+    with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM recovery_actions").fetchone()[0] == 1
 
 

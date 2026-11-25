@@ -17,6 +17,7 @@ from robotops.agent.client import DeepSeekClient
 from robotops.agent.context import ContextSnapshots, aggregate_logs, assemble, canonical
 from robotops.agent.memory import MemoryStore, WorkingMemory
 from robotops.agent.supervision import RoleScope
+from robotops.agent.usage import summarize_usage
 from robotops.agent.workflow import investigate
 from robotops.api import create_app
 from robotops.config import Config
@@ -545,6 +546,12 @@ def test_workflow_uses_memory_and_context_beyond_framework_default(investigation
     store, _, incident = investigation
     captured, evidence_id = [], None
 
+    class Observer:
+        app_id = "navigation"
+
+        def query_metrics(self, _sample_seconds):
+            return {"processed_count": 25, "in_flight_processing_age_ms": len(captured) * 1000}
+
     def model(messages, tools):
         """
             驱动 17 轮确定性交互以验证上下文基础设施，不测量模型故障推断能力。
@@ -574,6 +581,8 @@ def test_workflow_uses_memory_and_context_beyond_framework_default(investigation
                 "critical_ids": [evidence_id],
             }
             name = "update_working_memory"
+        elif turn < 17 and turn % 3 == 1 and turn > 1:
+            name, args = "query_metrics", {}
         elif turn < 17:
             name, args = "get_application_contract", {}
         else:
@@ -597,7 +606,8 @@ def test_workflow_uses_memory_and_context_beyond_framework_default(investigation
 
     # 17 轮超过框架默认节点上限；逐轮核对持久快照和实际输入，证明装配结果确实用于请求。
     run = investigate(
-        store, None, incident["id"], model, "fixture", context_strategy="evidence", max_model_calls=17,
+        store, Observer(), incident["id"], model, "fixture",
+        context_strategy="evidence", max_model_calls=17,
     )
     assert run["state"] == "COMPLETED" and len(captured) == 17
     snapshots = ContextSnapshots(store, run["id"])
@@ -735,7 +745,24 @@ def test_transport_error_keeps_reported_usage(investigation):
     run = investigate(store, None, incident["id"], client.complete, "fixture")
     assert run["state"] == "FAILED"
     events = store.trace(run["id"])
-    assert events[1]["type"] == "model_error" and events[1]["usage"] == {"prompt_tokens": 19}
+    failed = next(e for e in events if e["type"] == "model_error")
+    assert failed["usage"] == {"prompt_tokens": 19}
+
+
+def test_claimed_budget_is_recorded_even_when_snapshot_save_fails(investigation, monkeypatch):
+    store, _, incident = investigation
+
+    def fail(*_args):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(ContextSnapshots, "save", fail)
+    run = investigate(store, None, incident["id"], fail, "fixture", max_model_calls=2)
+    assert run["state"] == "FAILED"
+    usage = summarize_usage(store.trace(run["id"]), [])
+    assert usage["recorded_attempts"] == usage["context_requests"] == 0
+    assert usage["model_budget"] == {
+        "limit": 2, "claimed": 1, "remaining": 1, "denied_claims": 0, "report_only": None,
+    }
 
 
 def test_case_is_never_accepted_as_current_root_cause(investigation):

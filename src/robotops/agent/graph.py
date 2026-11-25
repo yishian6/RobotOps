@@ -4,6 +4,8 @@ import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
+from threading import Lock
 from time import monotonic
 from typing import TypedDict
 
@@ -14,9 +16,28 @@ from ..observations import compact_model_observation
 from ..storage import Store
 from .client import AssistantMessage, DeepSeekClient, ModelError
 from .context import ContextSnapshots, Strategy, assemble
-from .recovery import OPTIONAL_TOOLS, InvestigationRecovery
+from .recovery import MAX_STALLED_ROUNDS, OPTIONAL_TOOLS, InvestigationRecovery
 
 DEFAULT_MAX_MODEL_CALLS = 8
+
+
+class ModelCallBudget:
+    """Atomically share a run's request limit across the supervisor and its branches."""
+
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._left = limit
+        self._lock = Lock()
+
+    def claim(self, *, reserve: int) -> tuple[bool, dict[str, int]]:
+        with self._lock:
+            accepted = self._left > reserve
+            if accepted:
+                self._left -= 1
+            return accepted, {
+                "limit": self._limit, "claimed": self._limit - self._left,
+                "remaining": self._left, "reserved_for_parent_report": reserve,
+            }
 
 
 class InvestigationState(TypedDict):
@@ -53,6 +74,7 @@ class InvestigationGraph:
     model_name: str
     context_strategy: Strategy
     snapshots: ContextSnapshots
+    budget: ModelCallBudget
 
     def _request_message(
         self, outgoing: list[dict], tools: list[dict], tags: dict,
@@ -104,54 +126,73 @@ class InvestigationGraph:
         final_tool: str,
         deadline: float | None = None,
         initial_evidence_ids: tuple[str, ...] = (),
-        max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
     ) -> dict:
         """运行一个 Agent，直到提交报告或子调查发现。"""
         invalid_submissions = set()
-        recovery = InvestigationRecovery(initial_evidence_ids) if deadline is None else None
+        recovery = InvestigationRecovery(
+            partial(self.store.read_evidence, self.run_id), initial_evidence_ids,
+        )
+        is_branch = deadline is not None
         memory_enabled = any(tool["function"]["name"] == "update_working_memory" for tool in tools)
-        model_calls = 0
         context_sequence = 0
-
-        def closing_reason():
-            if recovery is not None and recovery.failed_tool:
-                return recovery.failed_tool
-            return "model_call_budget" if model_calls >= max_model_calls else None
+        closing = None
 
         def fallback_report(reason):
-            if recovery is None:
-                raise ModelError("Domain investigation reached its model-call limit without a valid finding")
+            if is_branch:
+                return {
+                    "status": "blocked", "blocked_reason": reason,
+                    "missing_observations": ["分支尚未提交经过校验的取证结果。"],
+                }
             return recovery.fallback_report(reason)
 
         def call_model(state: InvestigationState) -> InvestigationState:
-            nonlocal model_calls, context_sequence
+            nonlocal closing, context_sequence
             _remaining_time(deadline)
-            model_calls += 1
             history = state["messages"]
-            memory = memory_snapshot()
-            outgoing, manifest = assemble(history, memory, self.context_strategy)
-            available = tools
-            closing = closing_reason()
-            if closing is not None:
-                available = [tool for tool in tools if tool["function"]["name"] == final_tool]
-                manifest["report_only"] = closing
-            if closing == "model_call_budget":
-                tool, = available
-                function = tool["function"]
-                available = [{
-                    **tool, "function": {
-                        **function,
-                        "description": function["description"] + " 本轮是最后一次模型请求，请根据"
-                        "已有证据提交结果，明确标出缺少实测的结论和待查项。",
-                    },
-                }]
+            accepted, budget = self.budget.claim(reserve=1 if is_branch else 0)
+            closing = recovery.failed_tool
+            if not accepted:
+                closing = "model_call_budget"
+            elif closing is None and recovery.stalled_rounds >= MAX_STALLED_ROUNDS:
+                closing = "no_progress"
+            elif closing is None and budget["remaining"] == budget["reserved_for_parent_report"]:
+                closing = "model_call_budget"
+            audit = {"model_budget": budget, "stalled_tool_batches": recovery.stalled_rounds}
+            budget_event = {
+                "type": "model_budget", **tags, **audit, "accepted": accepted, "report_only": closing,
+            }
+            try:
+                if not accepted:
+                    return {"messages": history, "report": fallback_report("model_call_budget")}
+                memory = memory_snapshot()
+                outgoing, manifest = assemble(history, memory, self.context_strategy)
+                manifest.update(audit)
+                available = tools
+                if closing is not None:
+                    tool, = (tool for tool in tools if tool["function"]["name"] == final_tool)
+                    manifest["report_only"] = closing
+                    function = tool["function"]
+                    instruction = {
+                        "model_call_budget": " 本轮是最后一次模型请求。",
+                        "no_progress": " 连续查询未获得新线索，请结束调查。",
+                    }.get(closing, "")
+                    available = [{
+                        **tool, "function": {
+                            **function,
+                            "description": function["description"] + instruction + " 请根据已有证据"
+                            "提交结果，明确标出缺少实测的结论和待查项。",
+                        },
+                    }]
 
-            # 先保存实际发送视图，网络错误也能对应到输入。
-            context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
-            if len(history) == len(messages):
-                self.store.trace(self.run_id, {
-                    "type": "prompt", **tags, **metadata, "context_sequence": context_sequence,
-                })
+                # 先保存实际发送视图，网络错误也能对应到输入。
+                context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
+                budget_event["context_sequence"] = context_sequence
+                if len(history) == len(messages):
+                    self.store.trace(self.run_id, {
+                        "type": "prompt", **tags, **metadata, "context_sequence": context_sequence,
+                    })
+            finally:
+                self.store.trace(self.run_id, budget_event)
             try:
                 message = self._request_message(outgoing, available, tags, context_sequence, deadline)
             except ModelError:
@@ -189,7 +230,7 @@ class InvestigationGraph:
             history = list(state["messages"])
             calls = history[-1]["tool_calls"]
             report = None
-            closing = closing_reason()
+            progressed = False
             # 同批按顺序执行，让后面的调用能读取前面保存的证据和记忆。
             for call in calls:
                 _remaining_time(deadline)
@@ -218,7 +259,7 @@ class InvestigationGraph:
                         "status": "error", "error": "Working memory is disabled for this investigation",
                         "next_step": "Use the current evidence and submit the result when ready.",
                     }
-                elif recovery is not None and recovery.failed_tool and name in OPTIONAL_TOOLS:
+                elif recovery.failed_tool and name in OPTIONAL_TOOLS:
                     result = {
                         "status": "blocked",
                         "reason": (
@@ -229,11 +270,11 @@ class InvestigationGraph:
                 else:
                     result = compact_model_observation(name, execute(name, arguments))
 
-                if recovery is not None:
-                    failed_tool = recovery.failed_tool
-                    result = recovery.record(name, result)
-                    if not failed_tool and recovery.failed_tool:
-                        self.store.trace(self.run_id, {"type": "report_only", **tags, "tool": name})
+                failed_tool = recovery.failed_tool
+                result = recovery.record(name, result)
+                if not failed_tool and recovery.failed_tool:
+                    self.store.trace(self.run_id, {"type": "report_only", **tags, "tool": name})
+                progressed = recovery.record_progress(name, result) or progressed
                 trace_result = result
                 if result.get("evidence_id"):
                     trace_result = {key: value for key, value in result.items() if key != "data"}
@@ -248,6 +289,7 @@ class InvestigationGraph:
                     "tool_call_id": call["id"],
                     "content": json.dumps(result, ensure_ascii=False),
                 })
+            recovery.stalled_rounds = 0 if progressed else recovery.stalled_rounds + 1
             if closing is not None and report is None:
                 report = fallback_report(closing)
             return {"messages": history, "report": report}

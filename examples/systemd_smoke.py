@@ -37,12 +37,9 @@ def smoke_check() -> dict:
         env = {**os.environ, "ROBOTOPS_CONFIG": str(config_file), "ROBOTOPS_DATA_DIR": str(root / "data")}
         env.pop("DEEPSEEK_API_KEY", None)
 
-        def poll(app_id: str) -> dict:
+        def poll() -> dict:
             """
                 通过真实命令行进行一次监测，验证与 API 共享同一数据库。
-
-                Args:
-                    app_id: 已登记并启用恢复计划的测试服务。
 
                 Returns:
                     dict: 当前测试服务的状态与对应事件。
@@ -50,7 +47,6 @@ def smoke_check() -> dict:
             process = subprocess.run(
                 [
                     sys.executable, "-m", "robotops.cli", "monitor", "--once",
-                    "--plan-recovery-for", app_id,
                 ],
                 env=env, text=True, capture_output=True, timeout=10, check=True,
             )
@@ -73,8 +69,7 @@ def smoke_check() -> dict:
             with TestClient(app) as client:
                 registered = client.post("/services", json=target.model_dump()).raise_for_status().json()
                 assert registered["observation"]["state"] == "running", registered
-                app_id = registered["app_id"]
-                assert poll(app_id)["incident_id"] is None
+                assert poll()["incident_id"] is None
                 assert client.get("/incidents").raise_for_status().json() == []
 
                 trigger.touch()
@@ -83,13 +78,13 @@ def smoke_check() -> dict:
                     if monotonic() >= deadline:
                         raise AssertionError("systemd did not report the example's failed exit")
                     sleep(0.05)
-                failure = poll(app_id)
+                failure = poll()
                 assert failure["created"] and failure["incident_id"], failure
                 incident_id = failure["incident_id"]
                 event_url = f"/incidents/{incident_id}"
                 first = client.get(event_url).raise_for_status().json()
-                action = first["recovery_action"]
-                repeat = poll(app_id)
+                assert "recovery_action" not in first
+                repeat = poll()
                 assert repeat["incident_id"] == incident_id and not repeat["created"], repeat
 
                 incident = client.get(event_url).raise_for_status().json()
@@ -98,15 +93,10 @@ def smoke_check() -> dict:
                 assert observation["first_observation"]["result"] == "exit-code", observation
                 assert observation["first_observation"]["exec_main_status"] == 17, observation
                 assert observation["first_instance_id"] == registered["observation"]["instance_id"], observation
-                assert incident["recovery_action"] == action
-                assert action["unit"] == unit and action["scope"] == "user"
-                assert action["failed_instance_id"] == observation["first_instance_id"]
-                assert action["basis"] == observation["first_observation"]
-                assert action["state"] == "AWAITING_AUTHORIZATION"
+                assert "recovery_action" not in incident
                 assert manager.inspect(target).state == "failed"
                 return {
                     "unit": unit, "incident_id": incident_id, "occurrences": observation["occurrences"],
-                    "recovery_action_id": action["id"], "recovery_action_state": action["state"],
                 }
         finally:
             # 清理限定为本例随机生成的用户服务，避免残留失败单元或进程。

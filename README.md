@@ -4,11 +4,11 @@
 
 RobotOps 监测已登记的应用。ROS 1 Topic 停发时，C++ 采集器记录现场事实，Python Worker 自动创建故障事件并发起只读调查。报告的证据引用可以回查到这次停发的原始观测。
 
-当前版本 **0.2.0** 覆盖以下场景。
+当前版本 **0.4.0** 覆盖以下场景。
 
 | 场景 | 当前行为 |
 |---|---|
-| ROS 1 Noetic Topic 停发 | 自动采集事实、创建事件和调查任务，生成带证据的报告 |
+| ROS 1 Noetic Topic 停发 | 实时推送和启动回放共用同一任务入口，生成带证据的报告 |
 | 普通命令、ROS 1 launch 或 systemd 服务异常退出 | 自动记录退出事件，可以通过 API 发起只读调查 |
 | 已显式允许重启的 ROS 1 launch | 整个启动异常结束后可重启一次，记录新实例的启动验收 |
 | 本地 UDP pipeline | 可复现输入断流、处理停滞、配置不匹配和进程退出，提供无需模型密钥的离线回归 |
@@ -134,13 +134,7 @@ curl -fsS http://127.0.0.1:8000/incidents
 uv run python -m robotops_examples.systemd_smoke
 ```
 
-### 记录待授权的恢复动作
-
-用服务登记返回的 `app_id` 启动监测。指定服务确认意外退出时，事件详情中的 `recovery_action` 会记录固定重启目标、故障实例和现场读数。持续失败复用同一条记录，动作状态为 `AWAITING_AUTHORIZATION`。
-
-```bash
-uv run robotops monitor --plan-recovery-for "$APP_ID"
-```
+systemd 接入用于状态监测和事件记录。0.4.0 移除了 `--plan-recovery-for`，升级后仍可从原事件回查历史动作记录。当前恢复入口是前述 ROS 1 launch 的显式一次重启。
 
 ## 用 ROS 1 Topic 触发自动调查
 
@@ -162,7 +156,8 @@ mkdir -p data
 用同一个 Linux 用户，从仓库根目录先启动 Worker。示例从本地 `.env` 加载 `DEEPSEEK_API_KEY`。如果密钥已经导出，可省略 `--env-file .env`。
 
 ```bash
-uv run --env-file .env robotops watch-ros-facts camera --socket data/camera-ros-facts.sock
+uv run --env-file .env robotops watch-ros-facts camera \
+  --socket data/camera-ros-facts.sock --facts-db data/ros-facts.db
 ```
 
 另开一个终端，加载 Noetic 后启动采集器。最后两个参数分别是本机 Socket 和 C++ 事实库路径。
@@ -171,7 +166,7 @@ uv run --env-file .env robotops watch-ros-facts camera --socket data/camera-ros-
 build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 data/camera-ros-facts.sock data/ros-facts.db
 ```
 
-收到第一条 Topic 消息后开始监测，每段连续静默只写一条事实。C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。后台模型调查期间仍可接收新观测。Worker 停着时，事实留在 C++ 库里，自动调查接收启动后的新观测。
+收到第一条 Topic 消息后开始监测，每段连续静默只写一条事实。C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。Worker 启动及运行期间在后台分批补录漏接事实，每批最多 32 条，同时继续接收实时消息。回放与实时消息按来源和序号去重。待调查任务留在 SQLite 中，每次派发一条，`--once` 最多执行一次调查。停机时已开始的调查标记为中断失败，保留已有证据供复核。未指定 `--facts-db` 时，默认读取 `ROBOTOPS_DATA_DIR` 下的 `ros-facts.db`。
 
 在隔离测试应用中暂停该 Topic 的发布。Worker 会自动派发调查，并在完成后输出运行记录。核心 API、应用启动入口和 Worker 共用同一个 `ROBOTOPS_DATA_DIR`。启动 `uv run robotops serve` 之后，可以按下表查回完整链路。
 
@@ -181,12 +176,13 @@ build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 data/camera-r
 | `GET :8000/incidents/{id}` | 触发事实、自动任务状态和 `automatic_run_id` |
 | `GET :8000/runs/{run_id}` | 报告、运行状态或错误 |
 | `GET :8000/runs/{run_id}/evidence/{evidence_id}` | 报告引用的存证原文 |
+| `GET :8000/runs/{run_id}/usage` | 已占用、剩余、被拒绝的请求预算及模型实报用量 |
 
-自动调查默认最多调用模型六次，最后一次用于提交报告。若收尾轮未提交有效报告，系统保存带已有证据引用的待人工研判结果。停发事实说明采集器在给定窗口内没有收到消息，根因需要结合其他现场证据研判。
+自动调查默认最多调用模型六次。连续三批工具未获得新线索时提前进入收尾；达到预算时为报告保留最后一次请求。若收尾轮未提交有效报告，系统保存带已有证据引用的待人工研判结果。停发事实说明采集器在给定窗口内没有收到消息，根因需要结合其他现场证据研判。
 
 ## 使用模型调查
 
-启动示例服务后，在另一个终端执行。前几步仅在本地布置故障和创建事件，`/investigate` 会调用真实模型。默认每个 Agent 最多八次请求，最后一轮只允许提交报告或分支发现。
+启动示例服务后，在另一个终端执行。前几步仅在本地布置故障和创建事件，`/investigate` 会调用真实模型。一次手动调查默认总计最多八次请求，主 Agent 与子分支共享预算，主 Agent 保留一轮交报告。连续三批工具未获得新线索也会进入收尾。
 
 ```bash
 # 启动数据生产与处理进程，并注册示例应用。
@@ -291,7 +287,7 @@ uv run python -m robotops_benchmarks.e2e --plan \
   --modes single,supervised --repeats 1
 ```
 
-ROS 1 联调用真实 Topic 和固定模型响应验证「发布节点在线但停发 → C++ 保存事实 → Python 自动调查 → 证据回查」，真实模型调用为零。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。
+ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但停发 → C++ 保存事实 → Python 自动调查 → 证据回查」。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。0.4.0 另用 DeepSeek Flash 实测启动回放，3 次请求交付一份引用原始 Topic 证据的报告，实报输入 7,405 Token、输出 2,177 Token。 [实测记录](doc/RobotOps_当前版本汇报.md#040-自动-topic-实测)
 
 上下文实验对照完整历史、滚动摘录和证据感知装配，记录 UTF-8 输入字节数、关键值保留和工具协议检查结果。真实模型费用需要另行对照实报输入、输出和缓存 Token。
 
@@ -299,7 +295,7 @@ ROS 1 联调用真实 Topic 和固定模型响应验证「发布节点在线但�
 
 ## 后续方向
 
-- 接入规则恢复、持久动作记录和独立功能验收。
+- M4 用原 Topic 的持续输出验收业务恢复，记录验收结果与证据。
 - 在长调查中增加按需加载的排查 Skill 和上下文窗口管理。
 - 增加周期运维报告，并验证 ROS 2 与实体设备的观测接入。
 
