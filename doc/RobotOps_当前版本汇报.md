@@ -258,21 +258,13 @@ Worker 用 `(source_id, sequence)` 去重，在一个事务里把事件和调查
 
 版本 2 的输入把阶段更新成 `reporting`，提交的假设列表为空。输出的新记忆版本里，两条证据 ID 仍都在 `protected_ids`，完整的版本 1 也还在库里。较早的工具回复进入历史整理时，这两个 ID 会按受保护证据处理，原始数据也可按 ID 回查。 [反证保护测试](../tests/test_g1.py) · [工作记忆写入](../src/robotops/agent/memory.py)
 
-### 模型窗口怎么管，M5 待评测的设计
+### M5 请求前的模型窗口管理
 
-**128K 可以是某个模型的一轮总窗口。** 实际上限由选用的模型和服务端决定。系统指令、工具 Schema、任务、记忆、历史和工具返回都要计入输入预算，还要留出生成空间。目前代码已能做上面的证据整理，请求前 Token 估算、输入硬限额和按窗口压力触发压缩待实现。
+每轮发送前按消息和当轮开放的工具 Schema 估算输入，超过 131,072 时触发压缩。DeepSeek 官方为 `deepseek-flash` 列出的总窗口为 1,048,576 Token。生成上限采用服务端默认，也支持显式覆盖。 [DeepSeek 模型容量](https://api-docs.deepseek.com/api/list-models/)
 
-- **Claude Code** 在接近窗口上限时摘要历史，支持指定摘要应保留的重点。如果一次工具输出导致压缩后窗口反复填满，会停止自动压缩循环。 [Claude Code 的上下文机制](https://code.claude.com/docs/en/how-claude-code-works#when-context-fills-up) · [反复压缩的处理](https://code.claude.com/docs/en/troubleshooting#auto-compaction-stops-with-a-thrashing-error)
-- **Codex** 分别管理窗口硬上限和自动压缩触发阈值。超过阈值后，可以通过 `/responses/compact` 得到更短的上下文供后续请求使用。 [公开窗口计量实现](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/context_window.rs) · [Codex Agent Loop](https://openai.com/index/unrolling-the-codex-agent-loop/)
-- **DeepSeek Harness** 用模型窗口、生成预留和额外余量计算触发线。触发后可以先裁减大工具结果，空间够就跳过模型摘要；需要摘要时，保留近期成对的工具请求和回复，摘要较早的交互。其近期保留比例用于限定保留多少原始历史，整个请求还包含系统指令、工具定义和摘要。 [DeepSeek Harness 压缩设计](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/compaction/compaction-basic/README.md#tuning-when-condensation-starts)
+超出估算输入上限时，先控制旧历史的大小，再省去当前工具批次的助手草稿，将有原文证据的大工具结果替换为短记录。核心任务、工作记忆中的支持与反对引用，以及最近工具调用和结果的配对都保留。每一级复核，并参考刚收到的批次大小争取给后续查询留出空间。超限时可以专门提交报告；连报告请求也放不下时，程序用已有证据收尾。 [窗口裁剪与快照](RobotOps_上下文管理.md#6-m5-请求前的窗口裁剪)
 
-RobotOps 的待验证方案是先计量、再整理、最后按需摘要。
-
-1. **请求前算空间。** 按当前模型和服务端的限制算输入上限，给生成留预算。触发线还要能容纳一批有上限的工具输出和估算误差。日志和原文查询优先限制范围、条数和返回大小。
-2. **有窗口压力就先做低成本整理。** 用重复聚合、原文引用和已有工作记忆，再估算一次。需要摘要时才处理较早且已完成的交互。保留任务、关键数值、支持证据和反证的引用、最近一批成对的工具请求与回复，原文件仍可回查。
-3. **复核下一次触发前还能查几轮。** 用同一计量方式重算压缩后的占用。`触发线 − 压缩后占用` 才是再次触发前能新增的数据量。按回放里实际的工具结果增长量检验这段空间，至少能接住下一批受控结果及估算余量。若一条超大结果让空间很快见底，缩小查询或回取范围。遇到窗口超限，输入确实变小后才有限重试，空间仍不足时带着已有证据和待查项收尾。
-
-触发阈值、最近历史保留量和摘要上限由回放调参。短调查应直接完成，多轮调查要记录压缩次数和两次压缩之间做了几轮有效取证。另用单条大输出和大量独特证据测试预算与收尾。每次都记录压缩前后 Token、腾出的空间、耗时和关键证据保留情况。 [上下文管理](RobotOps_上下文管理.md#5-当前实测和窗口边界)
+Claude Code 会在接近窗口上限时自动压缩。Codex 的公开配置将自动压缩阈值和模型窗口分别提供给用户。RobotOps 当前采用单次调查中的规则裁剪，压缩量由回归数据测量。 [Claude Code 上下文机制](https://code.claude.com/docs/en/how-claude-code-works#when-context-fills-up) · [Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)
 
 ## 4. 两个数据库在哪里，各存了什么
 
@@ -380,6 +372,6 @@ API 仍从原故障查 `launch_restart`。外层 `state` 是进程验收，`topi
 | **M3a 自动调查** | C++ 写入 Noetic Topic 静默事实后主动推送，Python 自动建事件和派发调查。触发事实正文在 Python 任务表内保存一次，报告按证据 ID 回查。 |
 | **M3b 受控恢复** | ROS 1 Runner 支持显式允许的一次 launch 重启，并记录新实例的进程级验收。systemd 的旧动作仅用于历史回查。 |
 | **M4 业务验收** | 支持在 ROS 1 launch 重启后检查指定 Topic 的持续新消息，结果与观测摘要可随原事件回查。 |
-| **M5 窗口管理** | 基础证据整理、工作记忆、原文回取和快照可用，模型窗口预算和阈值压缩待实现。ROS 2 与实体设备感知也属于后续接入。 |
+| **M5 窗口管理** | 已接入输入预算、输出预留、分层裁剪、裁剪后复核和超限收尾。申请窗口和实报 Token 的差异可从快照和用量记录对照。 |
 
 本地回归覆盖真实 Noetic 的 Unix Socket 自动调查、一次重启成功和重启后仍失败。真实 ROS 观测用于验证感知、派发、报告协议和落盘链路。已有 DeepSeek UDP 对照用于验证处理停滞的工具选取和证据链。0.4.0 的 ROS 1 自动端到端结果见文首。默认短单 Agent 调查关闭记忆写入，完整日志复用已经查过的时段。 [评测入口](../README.md#测试与实验) · [上下文管理](RobotOps_上下文管理.md)

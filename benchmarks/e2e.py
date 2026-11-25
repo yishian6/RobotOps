@@ -23,7 +23,7 @@ from robotops_examples.pipeline.runtime import PipelineRuntime
 from robotops.agent.client import DeepSeekClient, _reported_usage
 from robotops.agent.context import ContextSnapshots
 from robotops.agent.workflow import INVESTIGATION_MODES, InvestigationMode, investigate
-from robotops.config import Config
+from robotops.config import Config, ContextWindow
 from robotops.models import ApplicationContract, DiagnosticReport, IncidentCreate, utc_now
 from robotops.storage import Store
 
@@ -412,6 +412,7 @@ def run_once(
                 context_strategy=strategy,
                 mode=investigation_mode,
                 branch_timeout_seconds=config.branch_timeout_seconds if config else Config.branch_timeout_seconds,
+                context_window=config.context_window if config else ContextWindow(),
             )
         finally:
             runtime.stop()

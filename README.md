@@ -254,8 +254,13 @@ curl -sS -X POST "http://127.0.0.1:8000/incidents/${INCIDENT_ID}/investigate"
 | `ROBOTOPS_DATA_DIR` | 持久化目录，默认 `data/`，包含 SQLite 数据库、运行日志、原始证据和轨迹 |
 | `ROBOTOPS_PROMPT_VERSION` | 基础调查提示词版本，默认 `v2` |
 | `ROBOTOPS_CONTEXT_STRATEGY` | 上下文策略，可选 `evidence`（默认）、`full` 和 `rolling` |
+| `ROBOTOPS_CONTEXT_COMPACT_AFTER_TOKENS` | 消息和工具 Schema 的估算输入压缩阈值，默认 131,072 |
+| `ROBOTOPS_CONTEXT_WINDOW_TOKENS` | 可选的模型总窗口覆盖值，默认 DeepSeek Flash 使用已知的服务端窗口 |
+| `ROBOTOPS_MODEL_OUTPUT_TOKENS` | 可选的单次生成上限。设置时作为请求的 `max_tokens` |
 
 两种模式共用调查模板，层级式另外加载主 Agent 和子 Agent 的角色提示词。模板与角色资源分别记录版本和内容指纹。[提示词资源](config/prompts/) · [层级式角色提示词](config/prompts/supervision/v1/roles.json)
+
+每次发送前，RobotOps 估算消息和工具 Schema 占用。超过 131,072 的默认输入阈值时，逐级整理旧历史和较大的工具正文，保留系统指令、用户任务、工作记忆和最近一批成对的工具消息。只在超过模型可用输入上限时，才进入只提交报告或本地人工复核收尾。生成上限默认采用服务端配置。[窗口计量与回查](doc/RobotOps_上下文管理.md#6-m5-请求前的窗口裁剪)
 
 ## 项目结构
 
@@ -309,7 +314,7 @@ ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但�
 
 ## 后续方向
 
-- 在长调查中增加按需加载的排查 Skill 和上下文窗口管理。
+- 在长调查中增加按需加载的排查 Skill。
 - 增加周期运维报告，并验证 ROS 2 与实体设备的观测接入。
 
 当前服务面向本地开发与验证，尚未提供远程访问鉴权或生产部署方案。

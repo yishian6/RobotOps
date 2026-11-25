@@ -159,6 +159,8 @@ class InvestigationRecovery:
             reason = "调查已达到模型请求上限，收尾轮未提交有效报告。请复核已有观测和待查项。"
         elif closing_reason == "no_progress":
             reason = "连续工具批次未获得新线索，调查已用现有证据收尾。请补充现场观测。"
+        elif closing_reason == "context_window":
+            reason = "请求超出工作上下文窗口，调查已用现有证据收尾。请缩小排查范围。"
         else:
             reason = f"{closing_reason} 反复返回同类错误或跳过结果，调查已用现有证据收尾。"
         return DiagnosticReport.model_validate({

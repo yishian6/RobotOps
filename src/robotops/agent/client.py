@@ -199,6 +199,7 @@ class DeepSeekClient:
                         api_key=self.config.api_key,
                         api_base=self.config.model_base_url,
                         timeout=self.config.model_timeout_seconds,
+                        max_tokens=self.config.model_output_tokens,
                         max_retries=0,
                         cache=False,
                         http_client=sync_http,

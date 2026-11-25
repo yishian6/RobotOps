@@ -77,6 +77,7 @@ def test_langgraph_accepts_provider_metadata_without_relaxing_tools(tmp_path, ar
                 httpx.Response: 工具请求或最终报告，均带固定的测试用量。
         """
         body = json.loads(request.content)
+        assert "max_tokens" not in body
         requests.append(body)
         if len(requests) == 1:
             message = {

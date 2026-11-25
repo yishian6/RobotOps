@@ -123,6 +123,7 @@ def investigate_fact(
         return investigate(
             store, None, incident_id, complete, config.model, prompt,
             config.context_strategy, automatic=True, max_model_calls=max_model_calls,
+            context_window=config.context_window,
         )
     except ConflictError:
         # A manual investigation can already own the event.
