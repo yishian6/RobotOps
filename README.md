@@ -4,13 +4,13 @@
 
 RobotOps 监测已登记的应用。ROS 1 Topic 停发时，C++ 采集器记录现场事实，Python Worker 自动创建故障事件并发起只读调查。报告的证据引用可以回查到这次停发的原始观测。
 
-当前版本 **0.4.0** 覆盖以下场景。
+当前开发基于 **0.4.0**，覆盖以下场景。
 
 | 场景 | 当前行为 |
 |---|---|
 | ROS 1 Noetic Topic 停发 | 实时推送和启动回放共用同一任务入口，生成带证据的报告 |
 | 普通命令、ROS 1 launch 或 systemd 服务异常退出 | 自动记录退出事件，可以通过 API 发起只读调查 |
-| 已显式允许重启的 ROS 1 launch | 整个启动异常结束后可重启一次，记录新实例的启动验收 |
+| 已显式允许重启的 ROS 1 launch | 整个启动异常结束后可重启一次，可验收指定原 Topic 的持续输出 |
 | 本地 UDP pipeline | 可复现输入断流、处理停滞、配置不匹配和进程退出，提供无需模型密钥的离线回归 |
 
 ## 工作流程
@@ -102,7 +102,21 @@ robotops run --restart-on-exit camera -- roslaunch camera_driver camera.launch
 
 整个 `roslaunch` 非零退出，或本机标为 `required="true"` 的节点非零退出并令该 launch 结束时，Runner 用同一启动参数重启一次。已有 `respawn="true"` 的普通节点仍由 `roslaunch` 拉起。前台操作员发出的停止信号照常转发，停止后本次命令结束。
 
-`GET /incidents/{id}` 的 `launch_restart` 将原故障连到新一轮执行。新 launch 完成启动并持续存活 5 秒后记为 `STABLE`，提前退出记为 `FAILED`，验收前主动停止记为 `INTERRUPTED`。这一状态描述启动进程，原事件仍供调查。Topic 停发走下方的取证流程，业务恢复需要看到原 Topic 持续有新消息。
+`GET /incidents/{id}` 的 `launch_restart` 将原故障连到新一轮执行。新 launch 完成启动并持续存活 5 秒后记为 `STABLE`，提前退出记为 `FAILED`，验收前主动停止记为 `INTERRUPTED`。
+
+### 验收重启后的原 Topic
+
+先按下文构建 C++ 采集器。启动时用 `--verify-topic` 指定应持续输出的完整 Topic 名，填写应用重映射后的实际名称。
+
+```bash
+robotops run --restart-on-exit --verify-topic /camera/image_raw \
+  --ros-facts-bin build/ros1_facts/robotops_ros1_facts camera -- \
+  roslaunch camera_driver camera.launch
+```
+
+重启的 launch 达到 `STABLE` 后，采集器在本次 launch 的 ROS Master 上订阅该 Topic，观察同一发布节点的连续新消息。每条消息的间隔须符合契约的 `health.max_output_silence_seconds`，默认 1 秒。观察窗口至少 5 秒，且至少为允许间隔的 3 倍。到达首条消息的等待也计入总超时，默认共 10 秒。新订阅收到的首条锁存回放会被跳过。
+
+在同一事件的 `launch_restart.topic_acceptance` 查看结果。运行中为 `PENDING`。通过为 `PASSED`，超时或观察期间 launch 退出为 `FAILED`，主动停止为 `INTERRUPTED`，采集器无法提供有效观测为 `UNAVAILABLE`。回执在获得观测后保留发布节点、时间、观测消息数、连续窗口长度和最大消息间隔。该检查面向持续更新的业务输出，验证的是 Topic 数据到达情况。Topic 停发且 launch 仍在线时，走下方的自动调查。
 
 ## 监测已有 Linux 服务
 
@@ -287,7 +301,7 @@ uv run python -m robotops_benchmarks.e2e --plan \
   --modes single,supervised --repeats 1
 ```
 
-ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但停发 → C++ 保存事实 → Python 自动调查 → 证据回查」。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。0.4.0 另用 DeepSeek Flash 实测启动回放，3 次请求交付一份引用原始 Topic 证据的报告，实报输入 7,405 Token、输出 2,177 Token。 [实测记录](doc/RobotOps_当前版本汇报.md#040-自动-topic-实测)
+ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但停发 → C++ 保存事实 → Python 自动调查 → 证据回查」，还验证重启后的持续输出、间歇输出、锁存回放和错误 Topic。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。0.4.0 曾用 DeepSeek Flash 实测启动回放，3 次请求交付一份引用原始 Topic 证据的报告，实报输入 7,405 Token、输出 2,177 Token。 [实测记录](doc/RobotOps_当前版本汇报.md#040-自动-topic-实测)
 
 上下文实验对照完整历史、滚动摘录和证据感知装配，记录 UTF-8 输入字节数、关键值保留和工具协议检查结果。真实模型费用需要另行对照实报输入、输出和缓存 Token。
 
@@ -295,7 +309,6 @@ ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但�
 
 ## 后续方向
 
-- M4 用原 Topic 的持续输出验收业务恢复，记录验收结果与证据。
 - 在长调查中增加按需加载的排查 Skill 和上下文窗口管理。
 - 增加周期运维报告，并验证 ROS 2 与实体设备的观测接入。
 

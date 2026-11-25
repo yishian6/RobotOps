@@ -19,7 +19,7 @@ from .agent.client import DeepSeekClient
 from .agent.prompt_loader import load_investigation_prompt
 from .agent.workflow import investigate
 from .config import Config
-from .models import Identifier, Model
+from .models import Identifier, Model, RosTopic
 from .storage import ConflictError, Store
 
 REPLAY_BATCH_SIZE = 32
@@ -29,7 +29,7 @@ REPLAY_INTERVAL_SECONDS = 1.0
 class FactSource(Model):
     source_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     app_id: Identifier
-    topic: str = Field(pattern=r"^/[A-Za-z0-9_/]+$", max_length=256)
+    topic: RosTopic
 
 
 class TopicFact(Model):

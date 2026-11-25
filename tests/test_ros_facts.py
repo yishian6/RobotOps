@@ -316,8 +316,11 @@ while not rospy.is_shutdown():
     not os.environ.get("ROBOTOPS_ROS1_FACTS_BIN"),
     reason="Requires a sourced ROS 1 Noetic environment",
 )
-@pytest.mark.parametrize("always_fail", [False, True], ids=["recover", "retry-fails"])
-def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, always_fail):
+@pytest.mark.parametrize("scenario", [
+    "process-only", "retry-fails", "continuous", "intermittent", "latched-only", "wrong-topic",
+    "operator-stop",
+])
+def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, scenario):
     package = tmp_path / "robotops_restart_fixture"
     package.mkdir()
     (package / "package.xml").write_text(
@@ -326,18 +329,35 @@ def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, al
         '<license>MIT</license></package>'
     )
     node = package / "fixture.py"
-    node.write_text(
-        "#!/usr/bin/python3\n"
-        "from pathlib import Path\n"
-        "import sys\n"
-        "from time import sleep\n"
-        "marker = Path(sys.argv[1])\n"
-        f"if {always_fail} or not marker.exists():\n"
-        "    marker.touch()\n"
-        "    print('first launch fails', flush=True)\n"
-        "    sys.exit(17)\n"
-        "sleep(60)\n"
-    )
+    node.write_text(f"""#!/usr/bin/python3
+from pathlib import Path
+import sys
+from time import monotonic, sleep
+
+import rospy
+from std_msgs.msg import String
+
+scenario = {scenario!r}
+marker = Path(sys.argv[1])
+if scenario == "retry-fails" or not marker.exists():
+    marker.touch()
+    print("first launch fails", flush=True)
+    sys.exit(17)
+
+rospy.init_node("fixture")
+topic = "/m4/other" if scenario == "wrong-topic" else "/m4/output"
+publisher = rospy.Publisher(topic, String, queue_size=1, latch=scenario == "latched-only")
+if scenario == "latched-only":
+    publisher.publish("old")
+    rospy.spin()
+start = monotonic()
+while not rospy.is_shutdown():
+    if scenario in ("continuous", "wrong-topic", "operator-stop") or (
+        scenario == "intermittent" and (monotonic() - start) % 1.0 < 0.2
+    ):
+        publisher.publish("fresh")
+    sleep(0.025)
+""")
     node.chmod(0o700)
     launch = package / "fixture.launch"
     launch.write_text(
@@ -346,6 +366,12 @@ def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, al
     )
     port = local_port()
     store = Store(tmp_path / "data")
+    store.register(ApplicationContract(
+        app_id="fixture", components=["process"], health={"max_output_silence_seconds": 0.4},
+    ))
+    verify = [] if scenario == "process-only" else [
+        "--verify-topic", "/m4/output", "--ros-facts-bin", os.environ["ROBOTOPS_ROS1_FACTS_BIN"],
+    ]
     env = {
         **os.environ, "ROBOTOPS_DATA_DIR": str(store.root), "ROS_IP": "127.0.0.1",
         "ROS_MASTER_URI": f"http://127.0.0.1:{port}", "ROS_HOME": str(tmp_path / "ros-home"),
@@ -358,7 +384,7 @@ def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, al
         for name, command in (
             ("roscore", ["roscore", "-p", str(port)]),
             ("runner", [
-                sys.executable, "-m", "robotops.cli", "run", "--restart-on-exit", "fixture",
+                sys.executable, "-m", "robotops.cli", "run", "--restart-on-exit", *verify, "fixture",
                 "--", "roslaunch", "--wait", "--screen", str(launch),
             ]),
         ):
@@ -368,7 +394,7 @@ def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, al
             )
             cleanup.callback(stop_process, process)
 
-        def stable():
+        def receipt():
             assert process.poll() is None, (tmp_path / "runner.log").read_text()
             for row in store.incidents():
                 event = store.incident(row["id"])
@@ -376,18 +402,56 @@ def test_live_ros1_required_node_exit_restarts_the_same_launch_once(tmp_path, al
                     return event
             return None
 
-        if always_fail:
+        if scenario == "retry-fails":
             assert process.wait(timeout=25) == 17, (tmp_path / "runner.log").read_text()
             events = [store.incident(row["id"]) for row in store.incidents()]
             original, = [event for event in events if "launch_restart" in event]
             assert original["launch_restart"]["state"] == "FAILED"
+            acceptance = original["launch_restart"]["topic_acceptance"]
+            assert acceptance["state"] == "FAILED"
+            assert acceptance["reason"] == "launch_not_stable"
             assert len(events) == 2
         else:
-            event = wait_until(stable, timeout=25)
+            event = wait_until(receipt, timeout=25)
             assert event["state"] == "OPEN"
             assert event["execution_exit"]["exit_code"] == 17
             assert event["launch_restart"]["execution_id"] != event["execution_exit"]["execution_id"]
             assert any("first launch fails" in line for line in store.execution_logs(event["id"])["lines"])
+            if scenario == "process-only":
+                assert "topic_acceptance" not in event["launch_restart"]
+            else:
+                def completed():
+                    acceptance = store.incident(event["id"])["launch_restart"]["topic_acceptance"]
+                    return acceptance if acceptance["state"] != "PENDING" else None
+
+                if scenario == "operator-stop":
+                    assert event["launch_restart"]["topic_acceptance"]["state"] == "PENDING"
+                    stop_process(process)
+                acceptance = wait_until(completed, timeout=20)
+                assert acceptance["topic"] == "/m4/output"
+                assert acceptance["max_gap_ms"] == 400
+                assert acceptance["checked_at"]
+                if scenario == "operator-stop":
+                    assert acceptance["state"] == "INTERRUPTED"
+                    assert acceptance["reason"] == "operator_stop"
+                else:
+                    observation = acceptance["observation"]
+                    if scenario == "continuous":
+                        assert acceptance["state"] == "PASSED"
+                        assert observation["publisher"] == "/fixture"
+                        assert observation["window_messages"] > 1
+                        assert observation["window_elapsed_ms"] >= acceptance["window_ms"]
+                        assert observation["window_max_gap_ms"] <= acceptance["max_gap_ms"]
+                    else:
+                        assert acceptance["state"] == "FAILED"
+                        if scenario == "intermittent":
+                            assert acceptance["reason"] == "window_not_met"
+                            assert observation["messages_observed"] > 1
+                            assert observation["window_elapsed_ms"] < acceptance["window_ms"]
+                        else:
+                            assert acceptance["reason"] == "no_fresh_messages"
+                            assert observation["messages_observed"] == 0
+                assert store.incident(event["id"])["launch_restart"]["state"] == "STABLE"
             stop_process(process)
             assert len(store.incidents()) == 1
         with store.connection() as db:

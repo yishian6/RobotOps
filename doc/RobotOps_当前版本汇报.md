@@ -1,6 +1,6 @@
 # RobotOps 项目阶段汇报
 
-**状态日期** 2026 年 11 月 24 日
+**状态日期** 2026 年 11 月 25 日
 
 RobotOps 持续观测机器人应用，发现异常后留下现场记录，并在适用的场景中自动发起调查。在本机 ROS 1 Noetic 上，已跑通完整链路：发布节点仍在线，Topic 停发，系统自动建事件、派任务、生成一份可以回查原始观测的诊断报告。当前采集链路使用本机 Unix Socket，由 C++ 在写入现场事实后主动推送给 Python。
 
@@ -302,7 +302,7 @@ ROS 触发事实通过证据 ID 回读 `ros_fact_tasks.fact`，新的触发证�
 | **Python `runtime.db`** | `applications`、`incidents`、`ros_fact_tasks`、`runs` | 应用契约；异常症状、来源和状态；触发事实 JSON、副本对应的来源和序号、已关联的调查；每次调查的模型、状态、起止时间、报告正文或错误。 |
 | **Python `runtime.db`** | `evidence`、`memories`、`context_snapshots`、`context_inputs`、`context_messages` | 证据的运行和事件归属、工具来源、时间、SHA-256；工作记忆每个版本的正文；每轮请求的消息与工作记忆引用、装配清单、工具与系统指令引用、序号和哈希，可重组为完整 JSON。 |
 | **Python `runtime.db`** | `cases`、`cases_fts` | 历史案例正文、应用与版本，以及全文检索索引。 |
-| **Python `runtime.db`** | `managed_services`、`service_exits`、`recovery_actions`、`executions`、`execution_exits`、`launch_restarts` | 已登记的 systemd 单元和观测、服务退出读数、旧版动作及依据、程序启动和结束记录、故障出口日志位置、重启前后执行关联与验收状态。 |
+| **Python `runtime.db`** | `managed_services`、`service_exits`、`recovery_actions`、`executions`、`execution_exits`、`launch_restarts` | 已登记的 systemd 单元和观测、服务退出读数、旧版动作及依据、程序启动和结束记录、故障出口日志位置、重启前后执行关联、进程验收状态与一份 Topic 验收摘要。 |
 
 Python 数据目录还保存三个目录下的文件。数据库用 ID 串起这些记录，查看一份完整报告时可以顺着 ID 找到原文。
 
@@ -320,7 +320,7 @@ RobotOps 根据观测类型分流。下面用相机举例。
 
 - **单个普通节点退出。** 已配置 `respawn="true"` 的节点由原 `roslaunch` 拉起。RobotOps 保留它的退出码和故障前的控制台输出。
 - **整条 launch 异常结束。** 用户运行 `robotops run --restart-on-exit camera -- roslaunch camera_driver camera.launch` 时，Runner 获准按原参数重启一次。触发条件是 launch 非零退出，或本机必需节点非零退出并导致这次 launch 结束。启动范围由这个 launch 文件定义。
-- **进程还在，Topic 停发。** C++ 把观测推给 Python，Worker 自动建任务并让 Agent 调查。有了确切故障依据以后，再决定处置目标。业务验收要看到原 Topic 在观察期内持续有新消息。
+- **进程还在，Topic 停发。** C++ 把观测推给 Python，Worker 自动建任务并让 Agent 调查。有了确切故障依据以后，再决定处置目标。
 
 一次重启的记录可以从 `GET /incidents/{id}` 直接读到。`execution_exit.execution_id` 指向故障前的旧启动和日志，`launch_restart.execution_id` 指向新的启动。Runner 等 ROS 报告启动完成，再观察 5 秒。通过记为 `STABLE`，提前退出记为 `FAILED`，验收中操作员停止记为 `INTERRUPTED`。`STABLE` 只说明新 launch 通过了进程级验收，原故障继续保留供调查。
 
@@ -343,13 +343,43 @@ Noetic 联调中，测试节点第一次退出码为 17，第二次启动达到�
 
 systemd 适合开机启动 RobotOps 自己、长期运行的非 ROS 服务，或需要无人值守的整套 bringup。独立的 systemd 服务监测负责记录服务退出事件。 [ROS 1 重启入口与查询](../README.md#为一个独立的-ros-1-launch-启用一次重启)
 
+### M4 重启后的 Topic 业务验收
+
+启动命令用 `--verify-topic /camera/image_raw` 标明应恢复的原输出。下面的验收由 Runner 与 C++ 采集器完成，过程中无需调用模型。
+
+```mermaid
+flowchart LR
+    A["原 launch 异常退出"] --> B["Runner 按原参数重启一次"]
+    B --> C["启动通过 5 秒进程验收"]
+    C --> D["C++ 在同一 ROS Master 订阅原 Topic"]
+    D --> E["观察同一发布节点的连续新消息"]
+    E --> F[("runtime.db<br/>原事件的重启回执")]
+```
+
+C++ 只统计实际收到的消息。观察窗口从第一条有效新消息开始，间隔超过上限或发布节点变化时重新计时。首条锁存回放会被跳过。间隔上限取应用契约的 `health.max_output_silence_seconds`，默认 1 秒。默认连续窗口为 5 秒，含等待的验收超时为 10 秒。验收前提前退出、观察超时和主动停止都会留下各自的结果。回执保留发布节点名，便于核对原 Topic 的消息来源。
+
+API 仍从原故障查 `launch_restart`。外层 `state` 是进程验收，`topic_acceptance.state` 是业务信号验收。SQLite 通过既有重启行关联原事件和新进程，额外记录目标 Topic、阈值、发布节点、有效消息数、连续窗口的时长、间隔和时间戳，每次重启只保留一份摘要。消息载荷留在 ROS 传输链路。 [启动命令](../README.md#验收重启后的原-topic)
+
+2026-11-25 10:01（北京时间），在隔离的 ROS 1 Noetic 环境用真实发布节点验证 `/m4/output`，要求消息间隔最多 400 ms、连续输出至少 5 秒。
+
+| 第二次启动后的现场 | 进程状态 | Topic 结果 |
+|---|---|---|
+| 连续发布 | `STABLE` | `PASSED`。5,016 ms 内收到 200 条消息，成功窗口内最大间隔 25 ms。 |
+| 间歇发布 | `STABLE` | `FAILED`。共收到 80 条，超时时最近连续窗口只有 176 ms。 |
+| 只有一条锁存回放，或持续发布在另一个 Topic | `STABLE` | `FAILED`。原 Topic 的有效新消息数为 0。 |
+| 观察中由操作员停止 | `STABLE` | `INTERRUPTED`。 |
+| 必需节点重启后再次异常退出 | `FAILED` | `FAILED`。原因是新 launch 未达到进程稳定期。 |
+
+包含上述场景在内，全量回归 110 项通过。结果摘要和连续发布、间歇发布两轮的 `runtime.db` 样本保存在本机 `data/ros1-m4-20261125/`。 [Noetic 联调用例](../tests/test_ros_facts.py)
+
 ## 6. 项目进度和验证
 
 | 能力 | 当前实际进度 |
 |---|---|
 | **M1 只读调查、M2 应用接入与退出监测** | 支持有证据引用的报告，支持普通程序、ROS 1 launch 和已登记 systemd 服务的异常退出接入。退出事件可从 API 发起调查。 |
 | **M3a 自动调查** | C++ 写入 Noetic Topic 静默事实后主动推送，Python 自动建事件和派发调查。触发事实正文在 Python 任务表内保存一次，报告按证据 ID 回查。 |
-| **M3b 受控恢复** | ROS 1 Runner 支持显式允许的一次 launch 重启，并记录新实例的进程级验收。systemd 的旧动作仅用于历史回查。M4 将用原 Topic 验收业务信号恢复。 |
+| **M3b 受控恢复** | ROS 1 Runner 支持显式允许的一次 launch 重启，并记录新实例的进程级验收。systemd 的旧动作仅用于历史回查。 |
+| **M4 业务验收** | 支持在 ROS 1 launch 重启后检查指定 Topic 的持续新消息，结果与观测摘要可随原事件回查。 |
 | **M5 窗口管理** | 基础证据整理、工作记忆、原文回取和快照可用，模型窗口预算和阈值压缩待实现。ROS 2 与实体设备感知也属于后续接入。 |
 
-本地回归覆盖真实 Noetic 的 Unix Socket 自动调查、一次重启成功和重启后仍失败。真实 ROS 观测用于验证感知、派发、报告协议和落盘链路。已有 DeepSeek UDP 对照用于验证处理停滞的工具选取和证据链。0.4.0 的 ROS 1 自动端到端结果见文首。默认短单 Agent 调查现在关闭记忆写入，完整日志只复用已经查过的时段。现行规则通过同场景离线回放，包含真实 Noetic 的全量回归共 102 项通过。 [评测入口](../README.md#测试与实验) · [上下文管理](RobotOps_上下文管理.md)
+本地回归覆盖真实 Noetic 的 Unix Socket 自动调查、一次重启成功和重启后仍失败。真实 ROS 观测用于验证感知、派发、报告协议和落盘链路。已有 DeepSeek UDP 对照用于验证处理停滞的工具选取和证据链。0.4.0 的 ROS 1 自动端到端结果见文首。默认短单 Agent 调查关闭记忆写入，完整日志复用已经查过的时段。 [评测入口](../README.md#测试与实验) · [上下文管理](RobotOps_上下文管理.md)

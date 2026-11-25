@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <nlohmann/json.hpp>
+#include <ros/callback_queue.h>
 #include <ros/ros.h>
 #include <sqlite3.h>
 #include <sys/file.h>
@@ -8,6 +9,7 @@
 #include <topic_tools/shape_shifter.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -40,6 +43,10 @@ std::int64_t integer(std::string_view text) {
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<Milliseconds>(WallClock::now().time_since_epoch()).count();
+}
+
+bool valid_topic(const std::string& topic) {
+    return topic.size() <= 256 && std::regex_match(topic, std::regex("/[A-Za-z0-9_/]+"));
 }
 
 void check(sqlite3* database, int result) {
@@ -265,6 +272,97 @@ private:
     ros::Subscriber subscriber_;
 };
 
+class TopicAcceptance {
+public:
+    TopicAcceptance(Milliseconds max_gap, Milliseconds window, Milliseconds timeout)
+        : max_gap_(max_gap), window_(window), deadline_(SteadyClock::now() + timeout) {}
+
+    void receive(const ros::MessageEvent<const topic_tools::ShapeShifter>& event) {
+        const auto now = SteadyClock::now();
+        if (now >= deadline_ || passed_) {
+            return;
+        }
+        const auto& header = event.getConnectionHeaderPtr();
+        if (!header) {
+            return;
+        }
+        const auto caller = header->find("callerid");
+        if (caller == header->end() || caller->second.empty()) {
+            return;
+        }
+        const auto& publisher = caller->second;
+        const auto latch = header->find("latching");
+        if (latch != header->end() && latch->second == "1") {
+            auto& previous = latched_connections_[publisher];
+            if (previous != header) {
+                // The replay on a new latched connection cannot establish new output.
+                previous = header;
+                return;
+            }
+        }
+        const auto wall_ms = now_ms();
+        const auto gap = now - last_;
+        if (window_messages_ == 0 || publisher != publisher_ || gap > max_gap_) {
+            first_ = now;
+            first_ms_ = wall_ms;
+            publisher_ = publisher;
+            max_gap_seen_ = SteadyClock::duration::zero();
+            window_messages_ = 0;
+        } else {
+            max_gap_seen_ = std::max(max_gap_seen_, gap);
+        }
+        ++messages_;
+        ++window_messages_;
+        last_ = now;
+        last_ms_ = wall_ms;
+        passed_ = now - first_ >= window_;
+    }
+
+    bool observing() const { return !passed_ && SteadyClock::now() < deadline_; }
+    bool passed() const { return passed_; }
+
+    Json observation() const {
+        return {
+            {"messages_observed", messages_}, {"window_messages", window_messages_},
+            {"window_elapsed_ms", std::chrono::duration_cast<Milliseconds>(last_ - first_).count()},
+            {"window_max_gap_ms", window_messages_ > 1
+                ? Json(std::chrono::duration_cast<Milliseconds>(max_gap_seen_).count()) : Json(nullptr)},
+            {"publisher", messages_ ? Json(publisher_) : Json(nullptr)},
+            {"first_message_at_ms", messages_ ? Json(first_ms_) : Json(nullptr)},
+            {"last_message_at_ms", messages_ ? Json(last_ms_) : Json(nullptr)},
+        };
+    }
+
+private:
+    Milliseconds max_gap_, window_;
+    SteadyClock::time_point deadline_, first_{}, last_{};
+    SteadyClock::duration max_gap_seen_{};
+    std::string publisher_;
+    std::map<std::string, boost::shared_ptr<ros::M_string>> latched_connections_;
+    std::int64_t messages_ = 0, window_messages_ = 0, first_ms_ = 0, last_ms_ = 0;
+    bool passed_ = false;
+};
+
+int verify_topic(const std::string& topic, std::int64_t gap, std::int64_t window, std::int64_t timeout) {
+    if (!valid_topic(topic) || gap < 1 || gap > 86400000 ||
+        window <= gap || timeout <= window || timeout > 604800000) {
+        throw std::invalid_argument("Invalid Topic verification arguments");
+    }
+    TopicAcceptance check{Milliseconds(gap), Milliseconds(window), Milliseconds(timeout)};
+    ros::CallbackQueue queue;
+    ros::NodeHandle node;
+    node.setCallbackQueue(&queue);
+    auto subscription = node.subscribe(topic, 1, &TopicAcceptance::receive, &check);
+    while (ros::ok() && check.observing()) {
+        queue.callOne(ros::WallDuration(0.02));
+    }
+    if (!ros::ok()) {
+        return 1;
+    }
+    std::cout << check.observation().dump() << std::endl;
+    return check.passed() ? 0 : 3;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -275,9 +373,13 @@ int main(int argc, char** argv) {
             return 0;
         }
         ros::init(argc, argv, "robotops_ros1_facts", ros::init_options::AnonymousName);
+        if (argc == 6 && std::string_view(argv[1]) == "--verify-topic") {
+            return verify_topic(argv[2], integer(argv[3]), integer(argv[4]), integer(argv[5]));
+        }
         if (argc != 6) {
             std::cerr << "Usage: robotops_ros1_facts APP_ID /TOPIC SILENCE_MS SOCKET DATABASE\n"
-                         "       robotops_ros1_facts --init-db DATABASE\n";
+                         "       robotops_ros1_facts --init-db DATABASE\n"
+                         "       robotops_ros1_facts --verify-topic /TOPIC GAP_MS WINDOW_MS TIMEOUT_MS\n";
             return 2;
         }
 
@@ -286,7 +388,7 @@ int main(int argc, char** argv) {
         const auto threshold = integer(argv[3]);
         const std::string database_path = argv[5];
         if (!std::regex_match(app, std::regex("[a-z][a-z0-9_-]{0,63}")) ||
-            topic.size() > 256 || !std::regex_match(topic, std::regex("/[A-Za-z0-9_/]+")) ||
+            !valid_topic(topic) ||
             threshold < 100 || threshold > 86400000) {
             throw std::invalid_argument("Invalid app, Topic, or silence threshold");
         }
