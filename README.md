@@ -2,7 +2,7 @@
 
 **面向机器人应用的本地故障监测与证据诊断系统。**
 
-RobotOps 监测已登记的应用。ROS 1 Topic 停发时，C++ 采集器记录现场事实，Python Worker 自动创建故障事件并发起只读调查。报告的证据引用可以回查到这次停发的原始观测。
+RobotOps 监测已登记的应用。ROS 1 Topic 首条消息超时或停发时，C++ 采集器记录现场事实，Python Worker 自动创建故障事件并发起只读调查。报告可通过证据 ID 回查触发调查的原始观测。
 
 当前版本 **0.5.0**，覆盖以下场景。
 
@@ -154,7 +154,7 @@ systemd 接入用于状态监测和事件记录。0.4.0 移除了 `--plan-recove
 
 ## 用 ROS 1 Topic 触发自动调查
 
-先用上面的 `robotops run` 接入应用并启动它的 ROS 1 launch。各终端使用同一个 `ROS_MASTER_URI`。下面以已登记的 `camera` 和 `/camera/image_raw` 为例，替换成实际应用 ID 和一个**应持续更新**的 Topic。
+先用上面的 `robotops run` 接入应用。各终端使用同一个 `ROS_MASTER_URI`。下面以已登记的 `camera` 和 `/camera/image_raw` 为例，替换成实际应用 ID 和一个**应持续更新**的 Topic。要观察启动阶段，请在启动被测节点前启动采集器，并确保 ROS Master 已运行。
 
 ### 构建采集器
 
@@ -176,13 +176,16 @@ uv run --env-file .env robotops watch-ros-facts camera \
   --socket data/camera-ros-facts.sock --facts-db data/ros-facts.db
 ```
 
-另开一个终端，加载 Noetic 后启动采集器。最后两个参数分别是本机 Socket 和 C++ 事实库路径。
+另开一个终端，加载 Noetic 后启动采集器。示例将收到首条消息后的停发阈值设为 2 秒，将订阅后等待首条消息的阈值设为 10 秒。
 
 ```bash
-build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 data/camera-ros-facts.sock data/ros-facts.db
+build/ros1_facts/robotops_ros1_facts camera /camera/image_raw 2000 \
+  data/camera-ros-facts.sock data/ros-facts.db --startup-timeout-ms 10000
 ```
 
-收到第一条 Topic 消息后开始监测，每段连续静默只写一条事实。C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。Worker 启动及运行期间在后台分批补录漏接事实，每批最多 32 条，同时继续接收实时消息。回放与实时消息按来源和序号去重。待调查任务留在 SQLite 中，每次派发一条，`--once` 最多执行一次调查。停机时已开始的调查标记为中断失败，保留已有证据供复核。未指定 `--facts-db` 时，默认读取 `ROBOTOPS_DATA_DIR` 下的 `ros-facts.db`。
+订阅后达到 `--startup-timeout-ms` 仍没有收到消息时，采集器只记录一次 `topic_startup_timeout`，其中 `last_message_at_ms` 为 `null`。收到首条消息后，每段超过停发阈值的连续静默只记录一次 `topic_silent`。省略 `--startup-timeout-ms` 时，从首条消息开始监测。首次启用前请同步更新采集器和 Worker。采集器会迁移原有事实表并保留序号。
+
+C++ 写入事实库后主动发送一条 Unix 数据报，Python 收到后建立事件和调查任务。Worker 启动及运行期间在后台分批补录漏接事实，每批最多 32 条，同时继续接收实时消息。回放与实时消息按来源和序号去重。待调查任务留在 SQLite 中，每次派发一条，`--once` 最多执行一次调查。停机时已开始的调查标记为中断失败，保留已有证据供复核。未指定 `--facts-db` 时，默认读取 `ROBOTOPS_DATA_DIR` 下的 `ros-facts.db`。
 
 在隔离测试应用中暂停该 Topic 的发布。Worker 会自动派发调查，并在完成后输出运行记录。核心 API、应用启动入口和 Worker 共用同一个 `ROBOTOPS_DATA_DIR`。启动 `uv run robotops serve` 之后，可以按下表查回完整链路。
 
@@ -308,7 +311,7 @@ uv run python -m robotops_benchmarks.e2e --plan \
   --modes single,supervised --repeats 1
 ```
 
-ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但停发 → C++ 保存事实 → Python 自动调查 → 证据回查」，还验证重启后的持续输出、间歇输出、锁存回放和错误 Topic。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。0.4.0 曾用 DeepSeek Flash 实测启动回放，3 次请求交付一份引用原始 Topic 证据的报告，实报输入 7,405 Token、输出 2,177 Token。 [实测记录](doc/RobotOps_当前版本汇报.md#040-自动-topic-实测)
+ROS 1 回归用真实 Topic 和固定模型响应验证发布节点在线但从未发出首条消息、正常开始发布后停发，以及对应的事实落盘、自动调查和证据回查。还验证重启后的持续输出、间歇输出、锁存回放和错误 Topic。未提供 C++ 二进制时，pytest 会跳过真实 ROS 1 联调，继续运行 Python 回归。0.4.0 曾用 DeepSeek Flash 实测启动回放，3 次请求交付一份引用原始 Topic 证据的报告，实报输入 7,405 Token、输出 2,177 Token。 [实测记录](doc/RobotOps_当前版本汇报.md#040-自动-topic-实测)
 
 发布回归要求在已加载 Noetic 且设置 `ROBOTOPS_ROS1_FACTS_BIN` 的环境运行全套 `pytest -q -rs`，汇报通过、失败和跳过数。GitHub Actions 的可选 **ROS 1 Noetic regression** 工作流在 Noetic 容器内构建采集器并跑全套，有跳过项即失败。工作流合入默认分支后可手动触发。 [Noetic 工作流](.github/workflows/ros1-noetic.yml) · [GitHub 手动触发规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
 
@@ -316,9 +319,28 @@ ROS 1 回归用真实 Topic 和固定模型响应验证「发布节点在线但�
 
 端到端评测用真实子进程布置故障。`scripted` 用固定回复验证单 Agent 管线与评分逻辑，`--plan` 仅预览调查组合。离线回归覆盖两种调查模式，包括双分支等待、证据隔离和超时回收。真实模型的诊断质量和用量需用相同场景做对照。
 
+## 排查 Skill
+
+关联了采集器首条消息超时或停发事实的调查会加载 ROS 1 Topic 静默排查 Skill。它提示模型根据信号类型核对起算时间，分别解释检测阈值、业务静默上限和可能的故障原因。已加载的 Skill 名称和内容指纹可从调查轨迹回查。 [ROS 1 静默指引](config/skills/ros1-topic-silence/SKILL.md)
+
+## 可选 Redis 分页缓存
+
+SQLite 负责查询证据归属和原文哈希，文件保存原文。Redis 暂存已校验并生成的日志分页。命中时仍校验 SQLite 归属和文件身份，省去原文读取、解析和分页。缓存未命中、超时或连接失败时，从原文读取并校验。原始证据接口直接读权威来源。
+
+使用已有的 Redis 实例时，安装可选客户端并在启动 RobotOps 或 ROS 1 Worker 前设置地址。下列命令以监听本机 `6379` 的 Redis 为例。如果 Redis 通过 Unix Socket 提供服务，可将地址改为实际路径，例如 `unix:///run/redis/redis.sock`。
+
+```bash
+uv sync --extra redis
+export ROBOTOPS_REDIS_CACHE_URL=redis://127.0.0.1:6379/0
+```
+
+缓存键包含运行、证据哈希、文件身份和分页参数。条目在 5 分钟后过期，每条最多 64 KiB。
+
+本机通过 TCP 连接系统 Redis 5.0.7，用同一份 200 行历史日志对照测试，每条路径回读 840 次。每批平均单次耗时的中位数由 SQLite 加原文文件的 1.621 ms 降到 SQLite 加 Redis 热命中的 0.757 ms，下降 53.3%。冷热结果和调查进展判断一致。独立 Redis 进程停止后，分页回到原文读取，结果也一致。
+
 ## 后续方向
 
-- 在长调查中增加按需加载的排查 Skill。
+- 为实测验证过的故障场景扩展按需加载的排查 Skill。
 - 增加周期运维报告，并验证 ROS 2 与实体设备的观测接入。
 
 当前服务面向本地开发与验证，尚未提供远程访问鉴权或生产部署方案。

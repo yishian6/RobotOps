@@ -34,14 +34,16 @@ class FactSource(Model):
 
 class TopicFact(Model):
     sequence: int = Field(gt=0, le=2**63 - 1, strict=True)
-    kind: Literal["topic_silent"]
+    kind: Literal["topic_silent", "topic_startup_timeout"]
     observed_at_ms: int = Field(gt=0, le=253402300799000, strict=True)
-    last_message_at_ms: int = Field(gt=0, le=253402300799000, strict=True)
+    last_message_at_ms: int | None = Field(gt=0, le=253402300799000, strict=True)
     silent_ms: int = Field(gt=0, strict=True)
     threshold_ms: int = Field(gt=0, strict=True)
 
     @model_validator(mode="after")
     def check_silence(self):
+        if (self.last_message_at_ms is None) != (self.kind == "topic_startup_timeout"):
+            raise ValueError("The observation kind and last message timestamp must agree")
         if self.silent_ms < self.threshold_ms:
             raise ValueError("Silence is below the configured threshold")
         return self
@@ -88,7 +90,8 @@ def replay_facts(store: Store, app_id: str, path: Path, *, limit: int = REPLAY_B
     source_fields = source.model_dump()
     imported = 0
     for row in missing:
-        fact = RosFact.model_validate({**source_fields, **dict(row), "kind": "topic_silent"})
+        kind = "topic_startup_timeout" if row["last_message_at_ms"] is None else "topic_silent"
+        fact = RosFact.model_validate({**source_fields, **dict(row), "kind": kind})
         imported += store.ingest_ros_fact(app_id, fact.model_dump()) is not None
     return imported
 
@@ -135,7 +138,7 @@ def watch_facts(
     facts_db: Path | None = None,
 ) -> int:
     """Receive live observations while a single background worker handles investigations."""
-    store = Store(config.data_dir)
+    store = Store(config.data_dir, redis_cache_url=config.redis_cache_url)
     store.contract(app_id)
     path = socket_path or store.root / f"{app_id}-ros-facts.sock"
     facts_path = facts_db or store.root / "ros-facts.db"

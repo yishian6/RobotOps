@@ -196,11 +196,11 @@ def _archive_history(
             active.update(hypothesis["support_ids"])
             active.update(hypothesis["contradict_ids"])
     protected_left = _PROTECTED_BODY_BYTES
-    remembered = {
-        eid for fact in _memory_view(memory)["memory"]["facts"] for eid in fact["evidence_ids"]
-    }
-    if memory["memory"]["phase"] == "triage":
-        remembered.clear()
+    remembered = set()
+    if memory["memory"]["phase"] != "triage":
+        remembered = {
+            eid for fact in _memory_view(memory)["memory"]["facts"] for eid in fact["evidence_ids"]
+        }
 
     archive, evidence = [], []
     seen, referenced = set(), set()
@@ -235,14 +235,14 @@ def _archive_history(
             "observed_at": data.get("observed_at"),
             "instance_status": instance_status,
         }
-        previous_instances = [
-            {"component": component, "instance_id": instance}
-            for component, instances in component_instances(data).items()
-            for instance in sorted(instances)
-            if component in latest_instances and instance not in latest_instances[component]
-        ]
-        if previous_instances:
-            entry["previous_component_instances"] = previous_instances
+        if latest_instances:
+            previous_instances = [
+                {"component": component, "instance_id": instance}
+                for component, instances in component_instances(data).items()
+                for instance in sorted(instances - latest_instances.get(component, instances))
+            ]
+            if previous_instances:
+                entry["previous_component_instances"] = previous_instances
         if strategy == "window" and evidence_id:
             arguments = entry["arguments"]
             if not isinstance(arguments, str) or len(arguments.encode()) > 256:
@@ -445,7 +445,10 @@ def estimate_input_tokens(
     )
     parts.append(json.dumps(tools, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     # Calibrated with DeepSeek Flash's reported prompt_tokens for RobotOps text/tool requests.
-    ascii_count = sum(len(part) if part.isascii() else sum(c.isascii() for c in part) for part in parts)
+    # ASCII encoding ignores non-ASCII characters. Count in bulk even for mixed-script logs.
+    ascii_count = sum(
+        len(part) if part.isascii() else len(part.encode("ascii", errors="ignore")) for part in parts
+    )
     characters = sum(map(len, parts))
     return characters - ascii_count // 2 + framing
 

@@ -14,8 +14,9 @@ import pytest
 
 from robotops.agent.client import ModelError
 from robotops.agent.context import ContextSnapshots
+from robotops.agent.workflow import investigate
 from robotops.config import Config
-from robotops.models import ApplicationContract
+from robotops.models import ApplicationContract, IncidentCreate
 from robotops.ros_facts import RosFact, investigate_fact, replay_facts, watch_facts
 from robotops.storage import Store
 
@@ -23,8 +24,12 @@ from robotops.storage import Store
 def complete_with_ros_evidence(messages, _tools):
     fact = json.loads(messages[1]["content"])["incident"]["ros_fact"]
     assert fact["topic"] == "/smoke/output"
+    summary = (
+        "No first message since subscribing" if fact["kind"] == "topic_startup_timeout"
+        else "Topic stopped delivering messages"
+    )
     return {"message": {"role": "assistant", "content": json.dumps({
-        "status": "needs_human", "summary": "Topic stopped delivering messages",
+        "status": "needs_human", "summary": summary,
         "hypotheses": [{
             "cause": "Exact cause unknown", "assessment": "unverified",
             "evidence_ids": [fact["evidence_id"]],
@@ -65,6 +70,10 @@ def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path, topic_fact
     evidence_id, = run["report"]["hypotheses"][0]["evidence_ids"]
     assert store.read_evidence(run["id"], evidence_id)["raw"]["data"] == topic_fact
     assert not list((tmp_path / "evidence").iterdir())
+    prompt, = (event for event in store.trace(run["id"]) if event["type"] == "prompt")
+    assert "## ROS 1 Topic 静默排查" in prompt["messages"][0]["content"]
+    assert prompt["skill"]["name"] == "ros1-topic-silence"
+    assert len(prompt["skill"]["sha256"]) == 64
 
     with store.connection() as db:
         db.execute(
@@ -74,15 +83,48 @@ def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path, topic_fact
         store.read_evidence(run["id"], evidence_id)
 
 
-def write_fact_database(path, topic_fact, sequences):
+def test_topic_skill_matches_stored_facts_and_keeps_the_same_tools(tmp_path, topic_fact):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    prompts = []
+    for enabled in (False, True):
+        fact = {**topic_fact, "sequence": 1 + enabled}
+        incident = store.ingest_ros_fact("camera", fact)
+        run = investigate(
+            store, None, incident, complete_with_ros_evidence, "fixture",
+            automatic=True, enable_skills=enabled,
+        )
+        assert run["state"] == "COMPLETED"
+        prompt, = (event for event in store.trace(run["id"]) if event["type"] == "prompt")
+        assert ("skill" in prompt) is enabled
+        prompts.append(prompt)
+    assert prompts[0]["tools"] == prompts[1]["tools"]
+    assert "## ROS 1 Topic 静默排查" not in prompts[0]["messages"][0]["content"]
+    assert "## ROS 1 Topic 静默排查" in prompts[1]["messages"][0]["content"]
+
+    manual = store.create_incident(IncidentCreate(app_id="camera", symptom="手工描述 topic_silent"))
+    run = investigate(store, None, manual["id"], lambda *_: {
+        "message": {"role": "assistant", "content": json.dumps({
+            "status": "needs_human", "summary": "需要现场观测。",
+            "recommended_action": {"kind": "collect_more_evidence", "reason": "核对消息到达"},
+        })},
+    }, "fixture")
+    assert run["state"] == "COMPLETED"
+    prompt, = (event for event in store.trace(run["id"]) if event["type"] == "prompt")
+    assert "skill" not in prompt
+
+
+def write_fact_database(path, topic_fact, sequences, *, legacy=False):
     with closing(sqlite3.connect(path)) as db, db:
-        db.executescript("""
+        last_message_constraint = "NOT NULL" if legacy else ""
+        db.executescript(f"""
             PRAGMA journal_mode=WAL;
             PRAGMA application_id=1380930374;
             CREATE TABLE source(slot INTEGER, id TEXT, app TEXT, topic TEXT);
             CREATE TABLE topic_silences(
-                sequence INTEGER PRIMARY KEY, observed_at_ms INTEGER,
-                last_message_at_ms INTEGER, silent_ms INTEGER, threshold_ms INTEGER
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL,
+                last_message_at_ms INTEGER {last_message_constraint},
+                silent_ms INTEGER NOT NULL, threshold_ms INTEGER NOT NULL
             );
         """)
         db.execute("INSERT INTO source VALUES(1, ?, ?, ?)", (
@@ -93,6 +135,26 @@ def write_fact_database(path, topic_fact, sequences):
                 sequence, topic_fact["observed_at_ms"], topic_fact["last_message_at_ms"],
                 topic_fact["silent_ms"], topic_fact["threshold_ms"],
             ))
+
+
+def test_replay_distinguishes_missing_first_message_from_silence(tmp_path, topic_fact):
+    store = Store(tmp_path)
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    fact_db = tmp_path / "ros-facts.db"
+    startup = {**topic_fact, "kind": "topic_startup_timeout", "last_message_at_ms": None}
+    assert RosFact.model_validate(startup).model_dump() == startup
+    with pytest.raises(ValueError, match="observation kind"):
+        RosFact.model_validate({**startup, "last_message_at_ms": topic_fact["last_message_at_ms"]})
+    with pytest.raises(ValueError, match="observation kind"):
+        RosFact.model_validate({**topic_fact, "last_message_at_ms": None})
+    with pytest.raises(ValueError, match="below the configured threshold"):
+        RosFact.model_validate({**startup, "silent_ms": 1})
+    write_fact_database(fact_db, startup, (1,))
+    assert replay_facts(store, "camera", fact_db) == 1
+    assert store.ingest_ros_fact("camera", startup) is None
+    incident, = store.incidents()
+    assert "no first message" in incident["symptom"]
+    assert store.incident(incident["id"])["ros_fact"] == startup
 
 
 def test_worker_replays_missing_facts_and_pending_tasks_after_restart(tmp_path, topic_fact, monkeypatch):
@@ -208,7 +270,31 @@ def stop_process(process):
     not os.environ.get("ROBOTOPS_ROS1_FACTS_BIN"),
     reason="Requires a built collector and a sourced ROS 1 Noetic environment",
 )
-def test_live_ros1_dual_database_chain(tmp_path, monkeypatch, capsys):
+def test_collector_upgrades_legacy_facts_without_reusing_sequences(tmp_path, topic_fact):
+    fact_db = tmp_path / "ros-facts.db"
+    write_fact_database(fact_db, topic_fact, (1, 2), legacy=True)
+    with closing(sqlite3.connect(fact_db)) as db, db:
+        db.execute("DELETE FROM topic_silences WHERE sequence=2")
+    subprocess.run(
+        [os.environ["ROBOTOPS_ROS1_FACTS_BIN"], "--init-db", str(fact_db)], check=True, timeout=10,
+    )
+    with closing(sqlite3.connect(fact_db)) as db, db:
+        latest, = db.execute("SELECT sequence, last_message_at_ms FROM topic_silences").fetchall()
+        assert latest == (1, topic_fact["last_message_at_ms"])
+        new = db.execute(
+            "INSERT INTO topic_silences (observed_at_ms, last_message_at_ms, silent_ms, threshold_ms) "
+            "VALUES (?, NULL, ?, ?)",
+            (topic_fact["observed_at_ms"], topic_fact["silent_ms"], topic_fact["threshold_ms"]),
+        )
+        assert new.lastrowid == 3
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ROBOTOPS_ROS1_FACTS_BIN"),
+    reason="Requires a built collector and a sourced ROS 1 Noetic environment",
+)
+@pytest.mark.parametrize("scenario", ["default", "first-message-on-time", "startup-timeout"])
+def test_live_ros1_dual_database_chain(tmp_path, monkeypatch, capsys, scenario):
     binary = Path(os.environ["ROBOTOPS_ROS1_FACTS_BIN"]).resolve(strict=True)
     fact_db = tmp_path / "ros-facts.db"
     config = Config(data_dir=tmp_path / "platform")
@@ -227,7 +313,6 @@ def test_live_ros1_dual_database_chain(tmp_path, monkeypatch, capsys):
         ROS_MASTER_URI=f"http://127.0.0.1:{master_port}", ROS_IP="127.0.0.1",
         ROS_HOME=str(tmp_path / "ros-home"), ROS_LOG_DIR=str(tmp_path / "ros-logs"),
     )
-
     with ExitStack() as cleanup:
         def launch(command, name):
             output = cleanup.enter_context((tmp_path / (name + ".log")).open("w"))
@@ -254,11 +339,6 @@ def test_live_ros1_dual_database_chain(tmp_path, monkeypatch, capsys):
 
         cleanup.callback(release_receiver)
         wait_until(socket_path.is_socket)
-        collector = launch(
-            [str(binary), "camera", "/smoke/output", "500", str(socket_path), str(fact_db)],
-            "collector",
-        )
-
         code = """
 import pathlib
 import sys
@@ -270,6 +350,7 @@ from std_msgs.msg import String
 root = pathlib.Path(sys.argv[1])
 rospy.init_node("robotops_fact_fixture")
 pub = rospy.Publisher("/smoke/output", String, queue_size=1, latch=True)
+(root / "publisher-ready").touch()
 while not rospy.is_shutdown():
     if not (root / "pause").exists():
         pub.publish("fixture output")
@@ -277,16 +358,35 @@ while not rospy.is_shutdown():
             (root / "ready").touch()
     time.sleep(0.025)
 """
+        pause = tmp_path / "pause"
+        pause.touch()
         publisher = launch(["/usr/bin/python3", "-c", code, str(tmp_path)], "publisher")
-        wait_until((tmp_path / "ready").exists)
-        sleep(0.6)
-        assert not store.incidents()
+        wait_until((tmp_path / "publisher-ready").exists)
+        command = [str(binary), "camera", "/smoke/output", "500", str(socket_path), str(fact_db)]
+        if scenario == "first-message-on-time":
+            command += ["--startup-timeout-ms", "3000"]
+            pause.unlink()
+        if scenario == "startup-timeout":
+            command += ["--startup-timeout-ms", "700"]
+        collector = launch(command, "collector")
 
-        (tmp_path / "pause").touch()
+        if scenario == "default":
+            sleep(0.6)
+            assert not store.incidents()
+            pause.unlink()
+        if scenario != "startup-timeout":
+            wait_until((tmp_path / "ready").exists)
+            sleep(0.1)
+            assert not store.incidents()
+            pause.touch()
+
         assert task.result(timeout=10) == 0
         assert publisher.poll() is None and collector.poll() is None and master.poll() is None
         run = json.loads(capsys.readouterr().out)
         assert run["state"] == "COMPLETED"
+        expected_kind = "topic_startup_timeout" if scenario == "startup-timeout" else "topic_silent"
+        prompt, = (event for event in store.trace(run["id"]) if event["type"] == "prompt")
+        assert prompt["skill"]["name"] == "ros1-topic-silence"
         evidence_id, = run["report"]["hypotheses"][0]["evidence_ids"]
         observation = store.read_evidence(run["id"], evidence_id)["raw"]["data"]
         assert not (store.root / "evidence" / f"{evidence_id}.json").exists()
@@ -299,9 +399,13 @@ while not rospy.is_shutdown():
             source = database.execute("SELECT id, app, topic FROM source").fetchone()
             facts = database.execute("SELECT * FROM topic_silences").fetchall()
             fact, = facts
+            if scenario == "startup-timeout":
+                assert fact["last_message_at_ms"] is None and fact["threshold_ms"] == 700
+            else:
+                assert fact["last_message_at_ms"] > 0 and fact["threshold_ms"] == 500
             assert observation == {
                 **dict(fact), "source_id": source["id"], "app_id": source["app"],
-                "topic": source["topic"], "kind": "topic_silent",
+                "topic": source["topic"], "kind": expected_kind,
             }
             assert database.execute(
                 "SELECT name FROM sqlite_master WHERE name='incidents'",
@@ -310,6 +414,15 @@ while not rospy.is_shutdown():
             assert database.execute(
                 "SELECT name FROM sqlite_master WHERE name='topic_silences'",
             ).fetchone() is None
+        if scenario == "startup-timeout":
+            pause.unlink()
+            wait_until((tmp_path / "ready").exists)
+            sleep(0.1)
+            pause.touch()
+            wait_until(lambda: replay_facts(store, "camera", fact_db) == 1)
+            pending, = store.queued_ros_fact_incidents("camera")
+            later = store.incident(pending)["ros_fact"]
+            assert later["sequence"] == 2 and later["kind"] == "topic_silent"
 
 
 @pytest.mark.skipif(

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from .evidence_cache import RedisEvidencePageCache
 from .models import (
     ApplicationContract,
     IncidentCreate,
@@ -48,17 +49,19 @@ class Store:
         文件和数据库不是同一个事务；此实现不承诺跨资源原子提交或崩溃自动恢复。
     """
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, redis_cache_url: str = ""):
         """
             创建可持久化的本地业务存储。
 
             Args:
                 root (Path): 数据根目录；内部创建 runtime.db、evidence/ 和 traces/。
+                redis_cache_url: 可选的证据分页缓存地址。
 
             Returns:
                 None: 初始化数据目录、线程锁及数据库表，不启动调查。
         """
         self.root = root.resolve()
+        self.evidence_page_cache = RedisEvidencePageCache(redis_cache_url) if redis_cache_url else None
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "evidence").mkdir(exist_ok=True)
         (self.root / "traces").mkdir(exist_ok=True)
@@ -274,10 +277,13 @@ class Store:
                 "SELECT 1 FROM ros_fact_tasks WHERE source_id=? AND sequence=?", identity,
             ).fetchone():
                 return None
-            request = IncidentCreate(
-                app_id=app_id, source="detector",
-                symptom=f"ROS 1 Topic {fact['topic']} had no messages for {fact['silent_ms']} ms",
-            )
+            topic = fact["topic"]
+            elapsed = fact["silent_ms"]
+            if fact["kind"] == "topic_startup_timeout":
+                symptom = f"ROS 1 Topic {topic} received no first message within {elapsed} ms of subscribing"
+            else:
+                symptom = f"ROS 1 Topic {topic} had no messages for {elapsed} ms"
+            request = IncidentCreate(app_id=app_id, source="detector", symptom=symptom)
             incident_id = self._insert_incident(db, request, utc_now())
             db.execute(
                 "INSERT INTO ros_fact_tasks (source_id, sequence, incident_id, fact) "
@@ -852,15 +858,25 @@ class Store:
             Returns:
                 dict: 证据索引元数据与校验通过的 raw 原文。
         """
-        # 同时匹配 run_id，防止模型使用其他调查的证据；读取时再验证内容未被改动。
+        return self.read_indexed_evidence(self.evidence_metadata(run_id, evidence_id))
+
+    def evidence_metadata(self, run_id: str, evidence_id: str) -> dict:
+        """Read the authoritative evidence index within one investigation."""
         with self.connection() as db:
             row = db.execute(
                 "SELECT * FROM evidence WHERE id=? AND run_id=?", (evidence_id, run_id)
             ).fetchone()
         if row is None:
             raise KeyError("Evidence not found in this investigation")
+        return dict(row)
+
+    def evidence_path(self, evidence_id: str) -> Path:
+        return self.root / "evidence" / f"{evidence_id}.json"
+
+    def read_indexed_evidence(self, row: dict) -> dict:
+        """Read and verify original evidence using a run-scoped index row."""
         # 用已匹配的数据库 ID 构造文件名，不直接把调用者提供的字符串作为文件路径。
-        path = self.root / "evidence" / f"{row['id']}.json"
+        path = self.evidence_path(row["id"])
         try:
             body = path.read_bytes()
         except FileNotFoundError:
@@ -876,7 +892,7 @@ class Store:
             body = json.dumps(raw, ensure_ascii=False, allow_nan=False).encode()
         if hashlib.sha256(body).hexdigest() != row["sha256"]:
             raise ValueError("Evidence integrity check failed")
-        return {**dict(row), "raw": json.loads(body)}
+        return {**row, "raw": json.loads(body)}
 
     def evidence_ids(self, run_id: str):
         """
@@ -893,7 +909,7 @@ class Store:
                 row[0] for row in db.execute("SELECT id FROM evidence WHERE run_id=?", (run_id,))
             }
 
-    def trace(self, run_id: str, event: dict | None = None):
+    def trace(self, run_id: str, event: dict | None = None, *, expand_references: bool = True):
         """
             传 event 时追加带 UTC 时间的轨迹，否则按写入顺序返回全部轨迹。
 
@@ -903,6 +919,7 @@ class Store:
             Args:
                 run_id (str): 调查运行 ID；查询和写入均限定在这个运行的归属范围内。
                 event (dict | None): 待追加的事件字典；为 None 时只读已有轨迹，不追加记录。
+                expand_references: 读取时恢复请求正文、工具定义和工具调用参数。
 
             Returns:
                 list[dict] | None: 读取时返回轨迹列表，写入时返回 None；无文件返回空列表。
@@ -920,6 +937,8 @@ class Store:
                 if path.exists()
                 else []
             )
+        if not expand_references:
+            return events
         model_calls = {}
         for item in events:
             if item.get("type") == "model" and item.get("message"):

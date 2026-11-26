@@ -19,5 +19,6 @@ data/
 !/README.md
 !/doc/RobotOps_当前版本汇报.md
 !/doc/RobotOps_上下文管理.md
+!/config/skills/*/SKILL.md
 .vscode
 .codegraph

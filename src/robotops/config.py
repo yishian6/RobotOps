@@ -68,6 +68,7 @@ class Config:
     context_compact_after_tokens: int = DEFAULT_COMPACT_AFTER_TOKENS
     context_window_tokens: int | None = None
     model_output_tokens: int | None = None
+    redis_cache_url: str = field(default="", repr=False)
     context_window: ContextWindow = field(init=False)
 
     def __post_init__(self):
@@ -212,4 +213,7 @@ class Config:
             if value not in {"true", "false"}:
                 raise ValueError("ROBOTOPS_MODEL_TRUST_ENV must be true or false")
             values["model_trust_env"] = value == "true"
-        return cls(**values, api_key=os.getenv("DEEPSEEK_API_KEY", ""))
+        return cls(
+            **values, api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+            redis_cache_url=os.getenv("ROBOTOPS_REDIS_CACHE_URL", "").strip(),
+        )

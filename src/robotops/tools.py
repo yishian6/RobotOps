@@ -2,6 +2,7 @@
     只读诊断工具：服务端绑定事件范围，校验参数，并为实际观测保存原始证据。
 """
 
+import hashlib
 import json
 from collections.abc import Collection
 from datetime import datetime
@@ -10,6 +11,7 @@ from typing import Annotated
 from pydantic import AwareDatetime, Field, ValidationError
 
 from .agent.memory import EvidenceID, MemoryStore, WorkingMemory
+from .evidence_cache import evidence_file_stamp
 from .models import ApplicationContract, Identifier, Model, utc_now
 from .observations import (
     ObservationSource,
@@ -333,8 +335,7 @@ class ToolGateway:
         # 原文回取沿用原证据身份，不生成新的观测时间或 ID，避免把旧结果包装成最新实测。
         if name == "read_evidence":
             try:
-                origin = self.store.read_evidence(self.run_id, args.evidence_id)
-                return _evidence_view({"status": "ok", **origin}, args)
+                return self._read_evidence(args)
             except (KeyError, ValueError) as exc:
                 return {"status": "error", "error": str(exc)}
         # 工作记忆是模型注记而非环境观测，不为更新记忆本身生成能支撑根因的证据。
@@ -419,6 +420,40 @@ class ToolGateway:
                 entry = {"id": evidence_id, "tool": name, "raw": raw}
                 return _log_view(payload, entry, log_key, preview, page)
         return result
+
+    def _read_evidence(self, args: EvidenceArgs) -> dict:
+        cache = self.store.evidence_page_cache
+        if cache is None:
+            origin = self.store.read_evidence(self.run_id, args.evidence_id)
+            return _evidence_view({"status": "ok", **origin}, args)
+
+        row = self.store.evidence_metadata(self.run_id, args.evidence_id)
+        path = self.store.evidence_path(row["id"])
+        stamp = evidence_file_stamp(path) if row["tool"] == "search_logs" else None
+        if stamp is None:
+            origin = self.store.read_indexed_evidence(row)
+            return _evidence_view({"status": "ok", **origin}, args)
+
+        identity = json.dumps([str(path), row, stamp, args.model_dump()], sort_keys=True).encode()
+        key = "robotops:evidence-page:v1:" + hashlib.sha256(identity).hexdigest()
+        cached = cache.get(key)
+        if cached is not None and evidence_file_stamp(path) == stamp:
+            page, observation = cached
+            if (
+                page.get("view") == "evidence_page"
+                and all(page.get(field) == row[field] == observation.get(field)
+                        for field in ("id", "sha256", "run_id", "tool"))
+            ):
+                return EvidenceView(page, observation)
+
+        origin = self.store.read_indexed_evidence(row)
+        page = _evidence_view({"status": "ok", **origin}, args)
+        if (
+            isinstance(page, EvidenceView) and page.get("view") == "evidence_page"
+            and evidence_file_stamp(path) == stamp
+        ):
+            cache.put(key, page, page.observation)
+        return page
 
     def _observe(self, name, args):
         """

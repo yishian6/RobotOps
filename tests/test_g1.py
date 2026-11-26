@@ -649,13 +649,14 @@ def manual_report():
 
 
 @pytest.mark.parametrize("invalid_protocol", [False, True])
-def test_api_cases_usage_snapshots_and_invalid_model_usage(tmp_path, invalid_protocol):
+def test_api_cases_usage_snapshots_and_invalid_model_usage(tmp_path, invalid_protocol, monkeypatch):
     """
         验证案例与快照接口、非法响应计费用量保留以及供应商私有字段不进入轨迹。
 
         Args:
             tmp_path: pytest 提供的独立临时目录，隔离本用例的数据库、证据和文件资源。
             invalid_protocol: True 注入错误调用协议与私有字段；False 只返回不合法的最终报告。
+            monkeypatch: 验证用量接口无需展开请求正文。
 
         Returns:
             None: 全部断言与预期异常检查通过时正常结束。
@@ -708,17 +709,26 @@ def test_api_cases_usage_snapshots_and_invalid_model_usage(tmp_path, invalid_pro
         run = client.post(f"/incidents/{incident['id']}/investigate").json()
         assert run["state"] == "FAILED"
         # 诊断失败也可能产生费用，且无效协议中的私有字段不能为记录用量而进入公开轨迹。
-        usage = client.get(f"/runs/{run['id']}/usage").json()
+        def unexpected_snapshot(*_):
+            pytest.fail("Usage must not load request snapshots")
+
+        with monkeypatch.context() as patches:
+            patches.setattr(ContextSnapshots, "get", unexpected_snapshot)
+            response = client.get(f"/runs/{run['id']}/usage")
+        assert response.status_code == 200
+        usage = response.json()
         assert usage["reported_tokens"] == {"prompt_tokens": 123, "completion_tokens": 9}
         assert usage["reported_cache_tokens"] == dict.fromkeys(("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"))
         assert usage["missing_cache_usage"] == {"prompt_cache_hit_tokens": 1, "prompt_cache_miss_tokens": 1}
         assert usage["context_requests"] == 1
-        assert "private-provider-field" not in json.dumps(
-            client.get(f"/runs/{run['id']}/trace").json()
-        )
+        trace = client.get(f"/runs/{run['id']}/trace").json()
+        assert "private-provider-field" not in json.dumps(trace)
         assert len(client.get(f"/runs/{run['id']}/contexts").json()) == 1
         snapshot = client.get(f"/runs/{run['id']}/contexts/1").json()
         assert snapshot["manifest"]["strategy"] == "evidence"
+        prompt_event, = (item for item in trace if item["type"] == "prompt")
+        assert prompt_event["messages"] == snapshot["messages"]
+        assert prompt_event["tools"] == snapshot["tools"]
         assert client.get(f"/runs/{run['id']}/memory").json()["version"] == 0
         assert client.get("/runs/other/contexts/1").status_code == 404
         assert not client.delete(f"/cases/{case['id']}").json()["enabled"]
