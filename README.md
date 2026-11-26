@@ -4,27 +4,31 @@
 
 **开发版本** `dev_zjh` 0.5.1　·　**已发布版本** `v0.5.0`
 
+## 项目架构
+
+RobotOps 在机器人主机上运行。**C++ 负责 ROS 1 感知和 Topic 验收，Python 负责事件、调查和受控重启。** DeepSeek 根据当前证据选择下一项只读检查，工具执行、证据保存和恢复状态都由本地程序处理。
+
+### 故障数据如何流转
+
+1. **ROS 1 自动调查。** C++ 检测首条消息超时或发布后停发，先将来源、序号、时间和阈值写入 `ros-facts.db`，再通过 Unix Socket 通知 Python。Worker 按来源和序号将实时消息与数据库回放去重，把触发事实交给 Agent，并按需加载 Topic 排查 Skill。
+2. **异常退出调查。** Runner 记录普通命令或 ROS launch 节点的退出码和故障前控制台位置。systemd 监测负责已登记服务的退出事件。可以从 API 发起调查，Agent 按事件回查已有日志或其他可用观测。
+3. **证据与报告。** LangGraph 负责模型与工具往返。网关校验工具参数、应用范围与证据归属。长日志先给预览，再按原证据分页。上下文装配保留任务和关键证据，超过阈值按优先级裁剪。长调查还可用工作记忆记录假设、支持证据和反证。最终报告通过引用和原文校验后保存，逐轮请求可从快照回查。
+
+### 恢复如何验收
+
+操作员通过 `--restart-on-exit` 授权 Runner 在指定 launch 异常退出后按原参数重启一次。新实例先过进程稳定检查，启用 `--verify-topic` 时再由 C++ 验收同一发布节点在原 Topic 上的连续新消息。业务验收 `PASSED` 后，Python 保存回执并关闭关联退出事件。
+
+### 主要模块与存储
+
+| 模块 | 职责 |
+|---|---|
+| [C++ 采集器](cpp/ros1_facts/) | ROS 1 消息到达观测、事实持久化、实时通知及重启后的 Topic 验收 |
+| [Python 平台](src/robotops/) | FastAPI、应用契约、事件与任务、Runner、工具网关和证据校验 |
+| [Agent 层](src/robotops/agent/) | DeepSeek 原生工具调用、LangGraph 循环、上下文、工作记忆和报告校验。默认单 Agent，手动调查可分派应用和系统子任务 |
+| SQLite、证据文件与 Redis | `ros-facts.db` 保存 C++ 事实，`runtime.db` 保存事件、任务、案例、证据索引、快照与报告。文件保留证据原文和 Trace，Redis 可缓存已校验的日志页 |
+| [配置](config/)、[示例](examples/)、[评测](benchmarks/)、[测试](tests/) | 运行配置、版本化 Prompt、Skill、可运行故障场景、对照实验和回归用例 |
+
 [项目技术文档](doc/RobotOps_技术文档.md) · [阶段汇报与实测](doc/RobotOps_当前版本汇报.md) · [上下文管理](doc/RobotOps_上下文管理.md)
-
-## 系统怎么工作
-
-```mermaid
-flowchart LR
-    ros["ROS 1 Topic"] --> collector["C++ 采集器"]
-    collector --> facts[("ros-facts.db")]
-    collector -->|"落盘后通过 Unix Socket 通知"| worker["Python Worker"]
-    facts -->|"只读补录漏接事实"| worker
-    worker --> incident["事件与调查任务"]
-    runner["Python Runner / systemd 监测"] -->|"记录异常退出"| incident
-    incident --> agent["Agent 调查"]
-    agent <-->|"原生工具调用"| tools["只读工具网关"]
-    tools --> source["现场适配器、历史案例、证据回读"]
-    agent --> report["校验报告及原始证据引用"]
-```
-
-- **感知。** ROS 1 采集器检测首条消息超时和发布后停发。普通命令、ROS launch 节点及已登记的 systemd 服务可记录异常退出。
-- **调查。** 默认单 Agent。模型根据观测选择工具，Python 校验权限、执行并保存证据。长日志先预览再分页，历史按证据重要性装配。手动调查也支持主 Agent 分派应用和系统检查。
-- **恢复。** 已启用重启的 ROS 1 launch 由 Runner 按原命令重启一次。新实例先通过进程稳定期，再按配置验收原 Topic。模型报告供研判，事件的恢复状态由实测回执决定。
 
 ## 快速开始
 
@@ -174,30 +178,3 @@ uv run python -m robotops_benchmarks.e2e --provider scripted \
 ROBOTOPS_ROS1_FACTS_BIN="$PWD/build/ros1_facts/robotops_ros1_facts" \
   uv run pytest -q -rs
 ```
-
-| 本地验证 | 结果 |
-|---|---|
-| 普通环境回归 | 123 项通过，11 项因需要 Noetic 而跳过 |
-| Noetic 全量回归 | 134 项通过，0 项跳过 |
-| DeepSeek 首条消息超时 | 同场景修复后 4 次请求降为 1 次，输入从 12,061 降至 2,093 Token。 [复测](doc/RobotOps_当前版本汇报.md#同场景修复复测) |
-| SQLite + Redis 热分页 | 同一份 200 行日志两条路径各回读 840 次，批次平均单次耗时的中位数从 1.621 ms 降到 0.757 ms。 [测量口径](doc/RobotOps_技术文档.md#redis-命中时省掉了什么) |
-
-## GitHub Actions 与发布
-
-| 触发 | 检查 |
-|---|---|
-| 推送 `dev_zjh` 或 `main` | `quality` 跑锁定依赖、Ruff、pytest、提示词检查和离线基准。 `package` 构建 wheel/sdist，检查资源与禁止文件，并在仓库外安装 wheel 检查 Prompt 和 Skill。 [CI](.github/workflows/ci.yml) |
-| PR 发往 `main` | `quality`、`package` 和 `noetic`。Noetic 在容器里构建 C++ 采集器并要求零跳过，也可手动运行；每天北京时间 02:00 另有一次定时运行。 [Noetic](.github/workflows/ros1-noetic.yml) |
-| 手动推送 `v*` 标签 | 核对 tag、包与运行时版本及提交是否已合入 `main`，在 tag 上重跑快速检查，用 `uv.lock` 安装依赖并复用同一归档检查，发布 wheel/sdist 和 `SHA256SUMS`。 [Release](.github/workflows/release.yml) |
-
-首个 PR 产生检查结果后，在 `main` 的分支保护或 Ruleset 中要求通过 PR、禁止绕过，要求 PR 分支与 `main` 同步，并将 `quality`、`package` 和 `noetic` 设为必过。维护者审核后手动合并，发版时再推送标签。 [GitHub 分支保护说明](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
-
-## 项目结构
-
-| 目录 | 职责 |
-|---|---|
-| `cpp/ros1_facts/` | ROS 1 采集、SQLite 落盘、本机通知和 Topic 验收 |
-| `src/robotops/` | API、Runner、事实 Worker、存储和工具网关 |
-| `src/robotops/agent/` | LangGraph 调查循环、上下文、工作记忆、角色与报告校验 |
-| `config/` | TOML、版本化 Prompt 和 ROS 1 Skill |
-| `examples/`、`benchmarks/`、`tests/` | 可运行示例、对照实验与自动回归 |
