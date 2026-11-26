@@ -18,22 +18,24 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.13.9"
           enable-cache: true
-      - name: Install locked test dependencies
+      - name: 安装锁定测试依赖
         run: uv sync --locked --extra dev
-      - name: Lint and validate prompts
+      - name: 检查代码并校验提示词
         run: |
           uv run --no-sync ruff check src tests benchmarks examples config .github/scripts
           uv run --no-sync robotops check-prompts
-      - name: Run Python tests
+      - name: 运行 Python 测试
         run: uv run --no-sync pytest -q -rs
-      - name: Verify offline context benchmark
+      - name: 验证离线上下文基准
         run: |
           uv run --no-sync python - <<'PY'
           import json
@@ -50,12 +52,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.13.9"
           enable-cache: true
-      - name: Build and verify packaged resources
+      - name: 构建并校验发布包
         run: bash .github/scripts/build_and_verify_package.sh "$RUNNER_TEMP/robotops-package"

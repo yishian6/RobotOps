@@ -17,15 +17,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.13.9"
           enable-cache: true
-      - name: Verify the tag is merged into main
+      - name: 校验标签已合入 main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -38,7 +40,7 @@ jobs:
               exit 1
               ;;
           esac
-      - name: Verify package versions
+      - name: 校验包版本
         run: |
           uv lock --check
           python3 - "$GITHUB_REF_NAME" <<'PY'
@@ -53,18 +55,18 @@ jobs:
           if tag != f"v{project['version']}" or runtime != project["version"]:
               raise SystemExit(f"Tag {tag}, package {project['version']} and runtime {runtime} must agree.")
           PY
-      - name: Re-run fast checks on the tagged commit
+      - name: 在标签提交上重跑快速检查
         run: |
           uv sync --locked --extra dev
           uv run --no-sync ruff check src tests benchmarks examples config .github/scripts
           uv run --no-sync robotops check-prompts
           uv run --no-sync pytest -q -rs
-      - name: Build and verify release artifacts
+      - name: 构建并校验发布产物
         run: |
           bash .github/scripts/build_and_verify_package.sh "$RUNNER_TEMP/robotops-release"
           cd "$RUNNER_TEMP/robotops-release"
           sha256sum -- *.whl *.tar.gz > SHA256SUMS
-      - name: Publish GitHub Release
+      - name: 发布 GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
