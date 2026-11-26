@@ -322,6 +322,52 @@ def test_evidence_pages_count_new_rows_without_a_second_read(tmp_path):
         assert not recovery.record_progress("read_evidence", narrower)
 
 
+def test_evidence_page_cache_reuses_only_an_unchanged_authorized_source(tmp_path, monkeypatch):
+    class LocalCache:
+        def __init__(self):
+            self.pages = {}
+
+        def get(self, key):
+            return self.pages.get(key)
+
+        def put(self, key, page, observation):
+            self.pages[key] = dict(page), observation
+
+    store = Store(tmp_path)
+    store.evidence_page_cache = LocalCache()
+    store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    incident = store.create_incident(IncidentCreate(app_id="camera", symptom="输出停滞"))
+    run_id = store.start_run(incident["id"], "fixture")
+    evidence_id = store.save_evidence(run_id, "search_logs", {
+        "status": "ok", "data": {"rows": [{"sample": 1}, {"sample": 2}]},
+    })
+    gateway = ToolGateway(store, None, run_id)
+    args = {"evidence_id": evidence_id, "limit": 1}
+    read = store.read_indexed_evidence
+    reads = []
+
+    def count_read(row):
+        reads.append(row["id"])
+        return read(row)
+
+    monkeypatch.setattr(store, "read_indexed_evidence", count_read)
+    first = gateway.execute("read_evidence", args)
+    cached = gateway.execute("read_evidence", args)
+    assert cached == first and cached.observation == first.observation
+    assert reads == [evidence_id]
+    assert gateway.execute("read_evidence", args, visible_evidence=set())["status"] == "error"
+    other_incident = store.create_incident(IncidentCreate(app_id="camera", symptom="另一次调查"))
+    other_run = store.start_run(other_incident["id"], "fixture")
+    assert ToolGateway(store, None, other_run).execute("read_evidence", args)["status"] == "error"
+    assert reads == [evidence_id]
+    page_two = gateway.execute("read_evidence", {**args, "offset": 1})
+    assert page_two["raw"]["data"]["rows"] == [{"sample": 2}]
+    assert reads == [evidence_id, evidence_id]
+    store.evidence_path(evidence_id).write_text('{"status":"ok","data":{"rows":[]}}')
+    assert gateway.execute("read_evidence", args)["error"] == "Evidence integrity check failed"
+    assert reads == [evidence_id, evidence_id, evidence_id]
+
+
 def test_context_elides_only_rows_and_fields_already_in_the_request():
     memory = {"version": 0, "protected_ids": [], "memory": WorkingMemory().model_dump()}
     prefix = [{"role": "system", "content": "只读"}, {"role": "user", "content": "查相机"}]

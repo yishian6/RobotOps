@@ -67,6 +67,14 @@ public:
         check(database_, sqlite3_bind_int64(statement_.get(), column, value));
     }
 
+    void bind(int column, std::optional<std::int64_t> value) {
+        if (value) {
+            bind(column, *value);
+        } else {
+            check(database_, sqlite3_bind_null(statement_.get(), column));
+        }
+    }
+
     void bind(int column, const std::string& value) {
         check(database_, sqlite3_bind_text(
             statement_.get(), column, value.c_str(), -1, SQLITE_TRANSIENT));
@@ -146,7 +154,10 @@ public:
             }
         }
 
-        check(handle, sqlite3_exec(handle, R"sql(
+        const auto execute = [handle](const char* sql) {
+            check(handle, sqlite3_exec(handle, sql, nullptr, nullptr, nullptr));
+        };
+        execute(R"sql(
             PRAGMA journal_mode=WAL;
             BEGIN IMMEDIATE;
             PRAGMA application_id=1380930374;
@@ -154,14 +165,35 @@ public:
                 slot INTEGER PRIMARY KEY CHECK (slot = 1),
                 id TEXT NOT NULL, app TEXT NOT NULL, topic TEXT NOT NULL
             );
+        )sql");
+        bool migrate;
+        {
+            Statement column(handle, R"sql(
+                SELECT "notnull" FROM pragma_table_info('topic_silences')
+                WHERE name = 'last_message_at_ms'
+            )sql");
+            migrate = column.next() && column.number(0) != 0;
+        }
+        if (migrate) {
+            execute("ALTER TABLE topic_silences RENAME TO legacy_topic_silences");
+        }
+        execute(R"sql(
             CREATE TABLE IF NOT EXISTS topic_silences (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                observed_at_ms INTEGER NOT NULL, last_message_at_ms INTEGER NOT NULL,
+                observed_at_ms INTEGER NOT NULL, last_message_at_ms INTEGER,
                 silent_ms INTEGER NOT NULL, threshold_ms INTEGER NOT NULL
             );
-            COMMIT;
-        )sql", nullptr, nullptr, nullptr));
-
+        )sql");
+        if (migrate) {
+            // Keep the old high-water mark, including any sequences whose rows were deleted.
+            execute(R"sql(
+                INSERT INTO topic_silences SELECT * FROM legacy_topic_silences;
+                DELETE FROM sqlite_sequence WHERE name = 'topic_silences';
+                UPDATE sqlite_sequence SET name = 'topic_silences' WHERE name = 'legacy_topic_silences';
+                DROP TABLE legacy_topic_silences;
+            )sql");
+        }
+        execute("COMMIT");
     }
 
     void bind_source(const std::string& app, const std::string& topic) {
@@ -179,7 +211,8 @@ public:
         source_ = {{"source_id", source.text(0)}, {"app_id", app}, {"topic", topic}};
     }
 
-    Json record(std::int64_t last_message_at_ms, Milliseconds silence, Milliseconds threshold) {
+    Json record(std::optional<std::int64_t> last_message_at_ms, Milliseconds silence,
+                Milliseconds threshold) {
         const auto observed_at_ms = now_ms();
         Statement row(database_.get(), R"sql(
             INSERT INTO topic_silences (observed_at_ms, last_message_at_ms, silent_ms, threshold_ms)
@@ -193,8 +226,10 @@ public:
 
         Json fact = source_;
         fact.update({
-            {"sequence", sqlite3_last_insert_rowid(database_.get())}, {"kind", "topic_silent"},
-            {"observed_at_ms", observed_at_ms}, {"last_message_at_ms", last_message_at_ms},
+            {"sequence", sqlite3_last_insert_rowid(database_.get())},
+            {"kind", last_message_at_ms ? "topic_silent" : "topic_startup_timeout"},
+            {"observed_at_ms", observed_at_ms},
+            {"last_message_at_ms", last_message_at_ms ? Json(*last_message_at_ms) : Json(nullptr)},
             {"silent_ms", silence.count()}, {"threshold_ms", threshold.count()},
         });
         return fact;
@@ -240,18 +275,21 @@ private:
 class TopicObserver {
 public:
     TopicObserver(ros::NodeHandle& node, FactDatabase& database, const FactPublisher& publisher,
-                  const std::string& topic, Milliseconds threshold)
+                  const std::string& topic, Milliseconds threshold,
+                  std::optional<Milliseconds> startup_timeout)
         : database_(database), publisher_(publisher), threshold_(threshold),
+          startup_timeout_(startup_timeout),
           subscriber_(node.subscribe(topic, 1, &TopicObserver::receive, this)) {}
 
     void poll() {
-        if (!last_message_ || recorded_) {
+        const auto threshold = last_message_ ? std::optional(threshold_) : startup_timeout_;
+        if (!threshold || recorded_) {
             return;
         }
         const auto silence = std::chrono::duration_cast<Milliseconds>(
-            SteadyClock::now() - *last_message_);
-        if (silence >= threshold_) {
-            publisher_.publish(database_.record(last_message_at_ms_, silence, threshold_));
+            SteadyClock::now() - last_message_.value_or(started_));
+        if (silence >= *threshold) {
+            publisher_.publish(database_.record(last_message_at_ms_, silence, *threshold));
             recorded_ = true;
         }
     }
@@ -266,10 +304,12 @@ private:
     FactDatabase& database_;
     const FactPublisher& publisher_;
     Milliseconds threshold_;
+    std::optional<Milliseconds> startup_timeout_;
     std::optional<SteadyClock::time_point> last_message_;
-    std::int64_t last_message_at_ms_ = 0;
+    std::optional<std::int64_t> last_message_at_ms_;
     bool recorded_ = false;
     ros::Subscriber subscriber_;
+    const SteadyClock::time_point started_ = SteadyClock::now();
 };
 
 class TopicAcceptance {
@@ -376,8 +416,9 @@ int main(int argc, char** argv) {
         if (argc == 6 && std::string_view(argv[1]) == "--verify-topic") {
             return verify_topic(argv[2], integer(argv[3]), integer(argv[4]), integer(argv[5]));
         }
-        if (argc != 6) {
-            std::cerr << "Usage: robotops_ros1_facts APP_ID /TOPIC SILENCE_MS SOCKET DATABASE\n"
+        if (argc != 6 && (argc != 8 || std::string_view(argv[6]) != "--startup-timeout-ms")) {
+            std::cerr << "Usage: robotops_ros1_facts APP_ID /TOPIC SILENCE_MS SOCKET DATABASE"
+                         " [--startup-timeout-ms TIMEOUT_MS]\n"
                          "       robotops_ros1_facts --init-db DATABASE\n"
                          "       robotops_ros1_facts --verify-topic /TOPIC GAP_MS WINDOW_MS TIMEOUT_MS\n";
             return 2;
@@ -387,6 +428,14 @@ int main(int argc, char** argv) {
         const std::string topic = argv[2];
         const auto threshold = integer(argv[3]);
         const std::string database_path = argv[5];
+        std::optional<Milliseconds> startup_timeout;
+        if (argc == 8) {
+            const auto timeout = integer(argv[7]);
+            if (timeout < 100 || timeout > 86400000) {
+                throw std::invalid_argument("Invalid Topic startup timeout");
+            }
+            startup_timeout = Milliseconds(timeout);
+        }
         if (!std::regex_match(app, std::regex("[a-z][a-z0-9_-]{0,63}")) ||
             !valid_topic(topic) ||
             threshold < 100 || threshold > 86400000) {
@@ -397,7 +446,7 @@ int main(int argc, char** argv) {
         database.bind_source(app, topic);
         FactPublisher publisher(argv[4]);
         ros::NodeHandle node;
-        TopicObserver observer(node, database, publisher, topic, Milliseconds(threshold));
+        TopicObserver observer(node, database, publisher, topic, Milliseconds(threshold), startup_timeout);
         ros::WallRate rate(50);
         while (ros::ok()) {
             ros::spinOnce();

@@ -17,6 +17,7 @@ from .context import ContextSnapshots, Strategy
 from .graph import DEFAULT_MAX_MODEL_CALLS, InvestigationGraph, ModelCallBudget
 from .memory import MemoryStore
 from .prompt_loader import InvestigationPrompt, investigation_messages, load_investigation_prompt
+from .skills import load_incident_skill
 from .supervision import RolePrompts, Supervision, load_role_prompts
 
 InvestigationMode = Literal["single", "supervised"]
@@ -178,6 +179,7 @@ def investigate(
     automatic: bool = False,
     max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
     context_window: ContextWindow = ContextWindow(),
+    enable_skills: bool = True,
 ):
     """运行只读调查并返回持久化记录。
 
@@ -209,9 +211,17 @@ def investigate(
         )
         incident, evidence_id = _with_trigger_evidence(store, run_id, incident)
         initial_evidence = (evidence_id,) if evidence_id is not None else ()
+        skill = (
+            load_incident_skill(incident)
+            if enable_skills and prompt.version != "investigation/v1" else None
+        )
+        if skill:
+            report_instruction += "\n\n" + skill[0]
         messages, metadata = investigation_messages(
             incident, contract, prompt, report_tool_instruction=report_instruction,
         )
+        if skill:
+            metadata["skill"] = skill[1]
         report_tool = {
             "type": "function",
             "function": {

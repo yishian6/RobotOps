@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+redis = ["redis>=6.4,<7"]
 dev = [
     "httpx>=0.27,<1",
     "pytest>=8,<10",
@@ -38,6 +39,7 @@ package-dir = {"robotops" = "src/robotops", "robotops.resources" = "config", "ro
     "prompts/investigation/*/*.txt",
     "prompts/investigation/*/manifest.json",
     "prompts/supervision/v1/roles.json",
+    "skills/*/SKILL.md",
 ]
 "robotops_examples.pipeline" = ["contract.json", "cases.json"]
 

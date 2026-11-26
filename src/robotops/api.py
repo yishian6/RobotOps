@@ -46,7 +46,7 @@ def create_app(
     config = config or Config.load()
     prompt = load_investigation_prompt(config.prompt_version, config.prompts_dir)
     role_prompts = load_role_prompts()
-    store = Store(config.data_dir)
+    store = Store(config.data_dir, redis_cache_url=config.redis_cache_url)
     service_manager = service_manager if service_manager is not None else SystemdServiceManager()
     app = FastAPI(title="RobotOps Agent", version=__version__)
     app.state.store = store
@@ -442,6 +442,6 @@ def create_app(
                 dict: 实报输入/输出及缓存用量、各项缺失计数和请求数量。
         """
         snapshots = ContextSnapshots(store, run_id).list(include_roles=True)
-        return summarize_usage(store.trace(run_id), snapshots)
+        return summarize_usage(store.trace(run_id, expand_references=False), snapshots)
 
     return app
