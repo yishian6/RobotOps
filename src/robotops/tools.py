@@ -11,7 +11,12 @@ from pydantic import AwareDatetime, Field, ValidationError
 
 from .agent.memory import EvidenceID, MemoryStore, WorkingMemory
 from .models import ApplicationContract, Identifier, Model, utc_now
-from .observations import ObservationSource, ObservationUnavailable, window_diagnostic_fields
+from .observations import (
+    ObservationSource,
+    ObservationUnavailable,
+    log_rows_key,
+    window_diagnostic_fields,
+)
 from .retrieval import CaseLibrary
 from .storage import Store
 
@@ -68,8 +73,25 @@ def _evidence_size(value) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
 
 
-def _log_rows_key(data: dict) -> str | None:
-    return next((key for key in ("rows", "lines", "logs") if isinstance(data.get(key), list)), None)
+class EvidenceView(dict):
+    """Model payload with the corresponding observation available to the local progress check."""
+
+    def __init__(self, payload: dict, observation: dict):
+        super().__init__(payload)
+        # Attributes are never serialized into model messages or the trace.
+        self.observation = observation
+
+
+def _log_view(payload: dict, entry: dict, key: str, visible: dict, page: dict) -> EvidenceView:
+    raw = entry["raw"]
+    source = raw["data"]
+    omitted = set(page["omitted_rows"])
+    # Sign the source rows actually shown, so narrower field selections cannot invent progress.
+    rows = [
+        source[key][index] for index, row in enumerate(visible[key], page["offset"])
+        if index not in omitted and row is not None and row != {}
+    ]
+    return EvidenceView(payload, {**entry, "raw": {**raw, "data": {**source, key: rows}}})
 
 
 def _evidence_view(entry: dict, args: EvidenceArgs) -> dict:
@@ -78,12 +100,13 @@ def _evidence_view(entry: dict, args: EvidenceArgs) -> dict:
     data = raw.get("data")
     if not isinstance(data, dict):
         return entry
-    log_key = _log_rows_key(data) if entry["tool"] == "search_logs" else None
+    log_key = log_rows_key(data) if entry["tool"] == "search_logs" else None
     if log_key is not None:
         selected, page = _log_page(data, log_key, offset=args.offset, limit=args.limit, fields=args.fields)
-        return {
+        payload = {
             **entry, "view": "evidence_page", "raw": {**raw, "data": selected}, "page": page,
         }
+        return _log_view(payload, entry, log_key, selected, page)
     if args.fields:
         selected = {key: data[key] for key in args.fields if key in data}
     elif _evidence_size(raw) <= _EVIDENCE_VIEW_BYTES:
@@ -97,11 +120,11 @@ def _evidence_view(entry: dict, args: EvidenceArgs) -> dict:
         if size <= remaining:
             fields[key] = value
             remaining -= size
-    return {
+    return EvidenceView({
         **entry, "view": "evidence_fields",
         "available_fields": [key for key in data if len(key) <= 96][:50],
         "raw": {**raw, "data": fields},
-    }
+    }, entry)
 
 
 def _log_page(
@@ -311,7 +334,7 @@ class ToolGateway:
         if name == "read_evidence":
             try:
                 origin = self.store.read_evidence(self.run_id, args.evidence_id)
-                return {"status": "ok", **_evidence_view(origin, args)}
+                return _evidence_view({"status": "ok", **origin}, args)
             except (KeyError, ValueError) as exc:
                 return {"status": "error", "error": str(exc)}
         # 工作记忆是模型注记而非环境观测，不为更新记忆本身生成能支撑根因的证据。
@@ -389,10 +412,12 @@ class ToolGateway:
             self._complete_log_scan = {"status": "ok", "observed_at": observed_at, **reference}
         result = {**raw, **reference}
         if name == "search_logs" and raw["status"] == "ok":
-            log_key = _log_rows_key(data)
+            log_key = log_rows_key(data)
             if log_key and (len(data[log_key]) > _LOG_PAGE_LIMIT or _evidence_size(data) > _EVIDENCE_VIEW_BYTES):
                 preview, page = _log_page(data, log_key)
-                return {**result, "data": preview, "view": "log_preview", "page": page}
+                payload = {**result, "data": preview, "view": "log_preview", "page": page}
+                entry = {"id": evidence_id, "tool": name, "raw": raw}
+                return _log_view(payload, entry, log_key, preview, page)
         return result
 
     def _observe(self, name, args):

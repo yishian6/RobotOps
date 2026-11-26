@@ -273,7 +273,7 @@ def test_window_retains_diagnostic_facts_and_prioritizes_explicit_evidence_reads
     assert "note" in reduced
 
 
-def test_evidence_pages_keep_source_rows_and_do_not_reset_progress(tmp_path):
+def test_evidence_pages_count_new_rows_without_a_second_read(tmp_path):
     store = Store(tmp_path)
     store.register(ApplicationContract(app_id="camera", components=["camera"]))
     incident = store.create_incident(IncidentCreate(app_id="camera", symptom="输出停滞"))
@@ -308,9 +308,80 @@ def test_evidence_pages_keep_source_rows_and_do_not_reset_progress(tmp_path):
     assert store.read_evidence(run_id, evidence_id)["raw"]["data"] == data
     assert first["id"] == last["id"] == evidence_id and first["sha256"] == last["sha256"]
     assert gateway.execute("read_evidence", args, visible_evidence=set())["status"] == "error"
-    recovery = InvestigationRecovery(lambda key: store.read_evidence(run_id, key))
-    assert recovery.record_progress("search_logs", preview)
-    assert not recovery.record_progress("read_evidence", last)
+    def unexpected_read(_):
+        pytest.fail("The progress check should use the observation loaded by the gateway")
+
+    recovery = InvestigationRecovery(unexpected_read)
+    assert not recovery.record_progress("search_logs", preview)  # The only row has no usable body.
+    assert not recovery.record_progress("read_evidence", first)
+    for offset in (0, 10, 20):
+        page = gateway.execute("read_evidence", {**args, "offset": offset, "limit": 10, "fields": ["sample"]})
+        assert recovery.record_progress("read_evidence", page)
+        assert not recovery.record_progress("read_evidence", page)
+        narrower = gateway.execute("read_evidence", {**args, "offset": offset, "limit": 5, "fields": ["sample"]})
+        assert not recovery.record_progress("read_evidence", narrower)
+
+
+def test_context_elides_only_rows_and_fields_already_in_the_request():
+    memory = {"version": 0, "protected_ids": [], "memory": WorkingMemory().model_dump()}
+    prefix = [{"role": "system", "content": "只读"}, {"role": "user", "content": "查相机"}]
+    # A subsequent user constraint keeps these turns in native tool-call form.
+    history = [*prefix, {"role": "user", "content": "对照早晚日志"}]
+    evidence_id = "ev-" + "1" * 32
+    record = {"telemetry": {"sample": 1, "message": "x" * 2000}}
+    new_record = {**record, "config_version": 2}
+
+    def append_page(tool, payload):
+        key = f"call-{len(history)}"
+        history.extend([
+            {"role": "assistant", "tool_calls": [{
+                "id": key, "type": "function", "function": {"name": tool, "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": key, "content": canonical(payload)},
+        ])
+
+    append_page("search_logs", {
+        "evidence_id": evidence_id, "view": "log_preview", "data": {"rows": [record]},
+        "page": {"offset": 1, "returned": 1, "total": 2, "next_offset": None},
+    })
+    append_page("read_evidence", {
+        "id": evidence_id, "view": "evidence_page", "raw": {"data": {"rows": [{"sample": 0}, record]}},
+        "page": {"offset": 0, "returned": 2, "total": 2, "next_offset": None},
+    })
+    append_page("read_evidence", {
+        "id": evidence_id, "view": "evidence_page", "raw": {"data": {"rows": [new_record]}},
+        "page": {"offset": 1, "returned": 1, "total": 2, "next_offset": None},
+    })
+    outgoing, manifest = assemble(history, memory)
+    assert manifest["request_bytes"] < manifest["source_bytes"]
+    earlier = json.loads(outgoing[6]["content"])
+    assert earlier["raw"]["data"]["rows"] == [{"sample": 0}]
+    assert earlier["page"]["row_indices"] == [0]
+    assert earlier["page"]["duplicate_rows"] == 1
+    assert outgoing[-1] == history[-1]  # The newly requested config_version remains visible.
+    assert json.loads(history[6]["content"])["raw"]["data"]["rows"][-1] == record
+
+
+def test_captured_console_does_not_replace_live_component_instances():
+    memory = {"version": 0, "protected_ids": [], "memory": WorkingMemory().model_dump()}
+    history = [{"role": "system", "content": "只读"}, {"role": "user", "content": "查相机"}]
+    samples = [
+        ("inspect_process", {"runtime_id": "live", "components": {"camera": {"telemetry": {
+            "component": "camera", "instance_id": "live-camera",
+        }}}}),
+        ("search_logs", {"source": "captured_console", "runtime_id": "prior", "lines": ["old"]}),
+        ("search_logs", {"source": "captured_console", "runtime_id": "prior", "lines": ["new"]}),
+    ]
+    for index, (tool, data) in enumerate(samples):
+        key = f"runtime-{index}"
+        history.extend([
+            {"role": "assistant", "tool_calls": [{
+                "id": key, "type": "function", "function": {"name": tool, "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": key, "content": canonical({"data": data})},
+        ])
+    _, manifest = assemble(history, memory, "rolling")
+    assert [row["instance_status"] for row in manifest["evidence"]] == ["same_runtime", "previous_runtime"]
 
 
 def test_window_drops_duplicate_replies_before_assistant_notes():

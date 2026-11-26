@@ -38,19 +38,10 @@ _FIRST_SAMPLE_STALL = re.compile(
 )
 
 
-def _validate_stall_timing(report: DiagnosticReport, observations: dict[str, dict]) -> None:
-    """Reject a first-sample stall claim when the same component had completed earlier work."""
-    target = report.recommended_action.target
-    if not target:
-        return
-    claims = [report.summary, *(h.cause for h in report.hypotheses if h.assessment == "supported")]
-    assertions = (
-        clause for claim in claims for clause in re.split(r"[。；;！!？?\n]", claim)
-        if not re.search(r"并非|不是|排除|无法判断|不能断言|不确定|是否|\bnot\b|\bwhether\b", clause)
-    )
-    if not any(_FIRST_SAMPLE_STALL.search(clause) for clause in assertions):
-        return
-    for observation in observations.values():
+def _prior_completions(observations) -> dict[str, dict[str, int]]:
+    """Index cited live telemetry by component and instance, including instances without a stall."""
+    completed_by_instance: dict[str, dict[str, int]] = {}
+    for observation in observations:
         raw = observation["raw"]
         if observation["tool"] not in {"query_metrics", "inspect_process"} or raw.get("status") != "ok":
             continue
@@ -59,22 +50,62 @@ def _validate_stall_timing(report: DiagnosticReport, observations: dict[str, dic
         components = snapshot.get("components") if isinstance(snapshot, dict) else None
         if not isinstance(components, dict):
             continue
-        component = components.get(target)
-        telemetry = component.get("telemetry") if isinstance(component, dict) else None
-        if not isinstance(telemetry, dict):
+        for name, component in components.items():
+            telemetry = component.get("telemetry") if isinstance(component, dict) else None
+            if not isinstance(telemetry, dict):
+                continue
+            instance = telemetry.get("instance_id")
+            instance = instance if isinstance(instance, str) else ""
+            instances = completed_by_instance.setdefault(name, {})
+            instances.setdefault(instance, 0)
+            count = telemetry.get("processed_count")
+            if type(count) is not int or count <= 0:
+                continue
+            try:
+                completed = datetime.fromisoformat(telemetry["last_output_at"])
+                started = datetime.fromisoformat(telemetry["processing_started_at"])
+                if completed < started:
+                    instances[instance] = max(count, instances[instance])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return completed_by_instance
+
+
+def _mentioned(value: str, clause: str) -> bool:
+    return bool(re.search(rf"(?<![a-z0-9_-]){re.escape(value)}(?![a-z0-9_-])", clause, re.IGNORECASE))
+
+
+def _validate_stall_timing(
+    report: DiagnosticReport, observations: dict[str, dict], components: list[str],
+) -> None:
+    """Validate a first-sample claim against the live observations cited for that claim."""
+    claims = [(report.summary, observations.keys())]
+    claims.extend(
+        (hypothesis.cause, hypothesis.evidence_ids)
+        for hypothesis in report.hypotheses if hypothesis.assessment == "supported"
+    )
+    for claim, references in claims:
+        assertions = [
+            clause for clause in re.split(r"[。；;！!？?\n]", claim)
+            if _FIRST_SAMPLE_STALL.search(clause)
+            and not re.search(r"并非|不是|排除|无法判断|不能断言|不确定|是否|\bnot\b|\bwhether\b", clause)
+        ]
+        if not assertions:
             continue
-        count = telemetry.get("processed_count")
-        if type(count) is not int or count <= 0:
-            continue
-        try:
-            completed = datetime.fromisoformat(telemetry["last_output_at"])
-            started = datetime.fromisoformat(telemetry["processing_started_at"])
-            earlier_completion = completed < started
-        except (KeyError, TypeError, ValueError):
-            continue
-        if earlier_completion:
+        observed = _prior_completions(observations[evidence_id] for evidence_id in references)
+        for clause in assertions:
+            named = [name for name in components if _mentioned(name, clause)]
+            candidates = named or [name for name, instances in observed.items() if any(instances.values())]
+            if len(candidates) != 1:
+                continue
+            name, = candidates
+            instances = observed.get(name, {})
+            named_instances = [instance for instance in instances if instance and _mentioned(instance, clause)]
+            known_instances = named_instances or list(instances)
+            if len(known_instances) != 1 or not (count := instances[known_instances[0]]):
+                continue
             raise ModelError(
-                f"{target} 已完成 {count} 个样本，且上次输出早于当前在途样本。"
+                f"{name} 已完成 {count} 个样本，且上次输出早于当前在途样本。"
                 "请改为描述在途样本自观测时间起未完成，以及未验证的阻塞点。"
             )
 
@@ -113,7 +144,7 @@ def _validate_report(
     target = validated.recommended_action.target
     if target and target not in components:
         raise ModelError("Model suggested a target outside the application contract")
-    _validate_stall_timing(validated, observations)
+    _validate_stall_timing(validated, observations, components)
     return validated.model_dump(mode="json")
 
 

@@ -14,7 +14,7 @@ from typing import Literal
 
 from ..config import ContextWindow
 from ..models import ApplicationContract
-from ..observations import window_diagnostic_fields
+from ..observations import log_rows_key, window_diagnostic_fields
 from ..storage import Store
 from .recovery import OPTIONAL_TOOLS
 
@@ -122,7 +122,7 @@ def component_instances(value) -> dict[str, set[str]]:
 
 
 def _latest_instances(messages: list[dict]) -> tuple[str | None, dict[str, set[str]]]:
-    """从完整历史确定当前会话和组件实例，原文回查不参与更新。"""
+    """只有实时进程和指标观测更新当前会话与组件实例。"""
     tool_names = {}
     latest_runtime = None
     latest_instances = {}
@@ -132,15 +132,14 @@ def _latest_instances(messages: list[dict]) -> tuple[str | None, dict[str, set[s
         if item["role"] != "tool":
             continue
         tool_name = tool_names.get(item["tool_call_id"])
-        if tool_name == "read_evidence":
+        if tool_name not in {"inspect_process", "query_metrics"}:
             continue
         observed = json.loads(item["content"]).get("data")
         if isinstance(observed, dict) and (runtime := observed.get("runtime_id")):
             if latest_runtime != runtime:
                 latest_instances.clear()
             latest_runtime = runtime
-        if tool_name in {"inspect_process", "query_metrics"}:
-            latest_instances.update(component_instances(observed))
+        latest_instances.update(component_instances(observed))
     return latest_runtime, latest_instances
 
 
@@ -266,6 +265,68 @@ def _archive_history(
     return archive, evidence, messages[boundary:]
 
 
+def _deduplicate_log_rows(messages: list[dict]) -> list[dict]:
+    """Remove rows already visible earlier in this request, retaining new field values."""
+    names = {}
+    seen = {}
+    outgoing = messages
+    for index, item in enumerate(messages):
+        for call in item.get("tool_calls", ()):
+            names[call["id"]] = call["function"]["name"]
+        if item["role"] != "tool":
+            continue
+        tool = names.get(item["tool_call_id"])
+        if tool not in {"search_logs", "read_evidence"}:
+            continue
+        payload = json.loads(item["content"])
+        page = payload.get("page")
+        if tool == "read_evidence" and payload.get("view") != "evidence_page":
+            continue
+        evidence_id = payload.get("evidence_id") or payload.get("id")
+        body = payload["raw"] if tool == "read_evidence" else payload
+        data = body.get("data")
+        log_key = log_rows_key(data) if isinstance(data, dict) else None
+        if not evidence_id or not log_key:
+            continue
+
+        offset = page["offset"] if page else 0
+        rows = data[log_key]
+        indices = page.get("row_indices") if page else None
+        if indices is None:
+            indices = range(offset, offset + len(rows))
+        kept, positions = [], []
+        for position, row in zip(indices, rows, strict=True):
+            key = (evidence_id, position)
+            previous = seen.get(key)
+            if isinstance(row, dict) and isinstance(previous, dict):
+                if all(field in previous and previous[field] == value for field, value in row.items()):
+                    continue
+                seen[key] = {**previous, **row}
+            elif row is not None:
+                if row == previous:
+                    continue
+                seen[key] = row
+            kept.append(row)
+            positions.append(position)
+        if not page or len(kept) == len(rows):
+            continue
+        reduced_page = {
+            **page, "returned": len(kept), "row_indices": positions,
+            "duplicate_rows": page.get("duplicate_rows", 0) + len(rows) - len(kept),
+        }
+        reduced_body = {**body, "data": {**data, log_key: kept}}
+        reduced = (
+            {**payload, "raw": reduced_body, "page": reduced_page}
+            if tool == "read_evidence" else {**reduced_body, "page": reduced_page}
+        )
+        content = canonical(reduced)
+        if len(content.encode()) < len(item["content"].encode()):
+            if outgoing is messages:
+                outgoing = list(messages)
+            outgoing[index] = {**item, "content": content}
+    return outgoing
+
+
 def assemble(
     messages: list[dict], memory: dict, strategy: Strategy = "evidence",
 ) -> tuple[list[dict], dict]:
@@ -294,12 +355,19 @@ def assemble(
 
     # 候选比完整历史更长时，仅 evidence 策略回退。计量使用 UTF-8 字节。
     source_bytes = len(canonical(source).encode())
-    candidate_bytes = source_bytes if outgoing is source else len(canonical(outgoing).encode())
+    fallback = source
+    fallback_bytes = source_bytes
+    if strategy == "evidence":
+        fallback = _deduplicate_log_rows(source)
+        if fallback is not source:
+            fallback_bytes = len(canonical(fallback).encode())
+        outgoing = fallback if outgoing is source else _deduplicate_log_rows(outgoing)
+    candidate_bytes = fallback_bytes if outgoing is fallback else len(canonical(outgoing).encode())
     request_bytes = candidate_bytes
     manifest["selected_view"] = "full" if strategy == "full" else "assembled"
-    if strategy == "evidence" and candidate_bytes > source_bytes:
-        outgoing = source
-        request_bytes = source_bytes
+    if strategy == "evidence" and candidate_bytes > fallback_bytes:
+        outgoing = fallback
+        request_bytes = fallback_bytes
         manifest["selected_view"] = "full_fallback"
         for entry in manifest["evidence"]:
             entry["candidate_view"], entry["view"] = entry["view"], "full_history"
@@ -528,7 +596,8 @@ def fit_context_window(
 
             def with_archive(batch):
                 archived = [_history_message(archive, memory, manifest)] if archive or memory["version"] else []
-                return tasks + archived + batch
+                native = tasks + archived + batch
+                return _deduplicate_log_rows(native) if manifest["strategy"] == "evidence" else native
 
             recent = _drop_assistant_prose(recent, archived=False)
             apply("archive", with_archive(recent), evidence)
