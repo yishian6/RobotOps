@@ -7,6 +7,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -17,6 +18,7 @@ from robotops.agent.context import ContextSnapshots
 from robotops.agent.workflow import investigate
 from robotops.config import Config
 from robotops.models import ApplicationContract, IncidentCreate
+from robotops.retrieval import CaseCreate, CaseLibrary
 from robotops.ros_facts import RosFact, investigate_fact, replay_facts, watch_facts
 from robotops.storage import Store
 
@@ -74,6 +76,12 @@ def test_ros_fact_is_dispatched_once_with_original_evidence(tmp_path, topic_fact
     assert "## ROS 1 Topic 静默排查" in prompt["messages"][0]["content"]
     assert prompt["skill"]["name"] == "ros1-topic-silence"
     assert len(prompt["skill"]["sha256"]) == 64
+    first = ContextSnapshots(store, run["id"]).get(1)
+    assert [tool["function"]["name"] for tool in first["tools"]] == ["submit_report"]
+    assert first["manifest"]["report_only"] == "no_available_observations"
+    health = json.loads(first["messages"][1]["content"])["contract"]["health"]
+    assert health == {"max_output_silence_seconds": 1.0}
+    assert store.contract("camera")["health"]["min_input_hz"] == 5.0
 
     with store.connection() as db:
         db.execute(
@@ -209,12 +217,22 @@ def test_live_worker_picks_up_a_fact_without_a_datagram(tmp_path, topic_fact, mo
     assert store.incident(incident["id"])["automatic_task_state"] == "COMPLETED"
 
 
-@pytest.mark.parametrize("limit, expected_calls, reason", [
-    (2, 2, "model_call_budget"), (6, 3, "update_working_memory"),
+@pytest.mark.parametrize("has_cases, limit, expected_calls, reason", [
+    (False, 6, 1, "no_available_observations"),
+    (True, 2, 2, "model_call_budget"),
+    (True, 6, 3, "update_working_memory"),
 ])
-def test_fallback_report_cites_trigger_observation(tmp_path, topic_fact, limit, expected_calls, reason):
+def test_fallback_report_cites_trigger_observation(
+    tmp_path, topic_fact, has_cases, limit, expected_calls, reason,
+):
     store = Store(tmp_path)
     store.register(ApplicationContract(app_id="camera", components=["camera"]))
+    if has_cases:
+        CaseLibrary(store).add(CaseCreate(
+            app_id="camera", app_version="1", components=["camera"], title="Topic silence",
+            symptoms="No output", root_cause="Fixture publisher stopped", resolution="Inspect publisher",
+            source_uri="fixture:case", verified_at=datetime.now(timezone.utc),
+        ))
     call_count = 0
 
     def complete(_messages, tools):
@@ -222,6 +240,9 @@ def test_fallback_report_cites_trigger_observation(tmp_path, topic_fact, limit, 
         call_count += 1
         if [tool["function"]["name"] for tool in tools] == ["submit_report"]:
             raise ModelError("Model could not finish the report")
+        assert {tool["function"]["name"] for tool in tools} == {
+            "retrieve_cases", "read_evidence", "submit_report",
+        }
         return {"message": {"role": "assistant", "tool_calls": [{
             "id": f"memory-{call_count}", "type": "function",
             "function": {"name": "update_working_memory", "arguments": "{}"},

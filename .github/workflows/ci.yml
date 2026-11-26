@@ -1,0 +1,65 @@
+name: CI
+
+"on":
+  push:
+    branches: [dev_zjh, main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.9"
+          enable-cache: true
+      - name: 安装锁定测试依赖
+        run: uv sync --locked --extra dev
+      - name: 检查代码并校验提示词
+        run: |
+          uv run --no-sync ruff check src tests benchmarks examples config .github/scripts
+          uv run --no-sync robotops check-prompts
+      - name: 运行 Python 测试
+        run: uv run --no-sync pytest -q -rs
+      - name: 验证离线上下文基准
+        run: |
+          uv run --no-sync python - <<'PY'
+          import json
+          from robotops_benchmarks.context import compare
+
+          result = compare()
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          evidence = [row for row in result["results"] if row["strategy"] == "evidence"]
+          if not evidence or any(row["failures"] for row in evidence):
+              raise SystemExit("The default evidence strategy failed an offline check.")
+          PY
+
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.9"
+          enable-cache: true
+      - name: 构建并校验发布包
+        run: bash .github/scripts/build_and_verify_package.sh "$RUNNER_TEMP/robotops-package"

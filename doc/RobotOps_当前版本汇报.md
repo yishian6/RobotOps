@@ -1,18 +1,41 @@
 # RobotOps 项目阶段汇报
 
-**状态日期** 2026 年 11 月 26 日
+**状态日期** 2026 年 11 月 26 日，适用版本 `dev_zjh` 0.5.1。发布记录见 `v0.5.0`。
 
-RobotOps 持续观测机器人应用，发现异常后留下现场记录，并在适用的场景中自动发起调查。在本机 ROS 1 Noetic 上，已跑通完整链路：发布节点仍在线，Topic 停发，系统自动建事件、派任务、生成一份可以回查原始观测的诊断报告。当前采集链路使用本机 Unix Socket，由 C++ 在写入现场事实后主动推送给 Python。
+RobotOps 持续观测机器人应用。ROS 1 发布节点上线后一直没有送达首条消息，或者开始输出后停止，两种情况都可以触发调查。C++ 先保存事实再通过本机 Unix Socket 通知 Python。Worker 自动建事件、派任务并交付可回查触发事实的报告。
 
 ## 0.5.0 发布后的开发验证
 
-**ROS 1 首条消息超时。** Noetic 测试让 `/smoke/output` 的发布节点保持在线并暂不发送。采集器订阅满 700 ms 时写入一条 `topic_startup_timeout`，原始记录中的 `last_message_at_ms` 为 `null`。Python 收到事实后发起调查，使用固定模型响应生成可回查该事实的 `needs_human` 报告。节点随后开始发布，暂停后又产生一条独立的 `topic_silent`。原有事实库会保留记录和序号，首条消息监测通过 `--startup-timeout-ms` 启用。 [操作说明](../README.md#用-ros-1-topic-触发自动调查)
+**ROS 1 首条消息超时。** Noetic 测试让 `/smoke/output` 的发布节点保持在线并暂不发送。采集器订阅满 700 ms 时写入一条 `topic_startup_timeout`，原始记录中的 `last_message_at_ms` 为 `null`。Python 收到事实后发起调查，使用固定模型响应生成可回查该事实的 `needs_human` 报告。节点随后开始发布，暂停后又产生一条独立的 `topic_silent`，测得静默 519 ms。首条消息监测通过 `--startup-timeout-ms` 启用，原有事实库迁移保留记录和序号。 [操作说明](../README.md#用-ros-1-topic-触发自动调查)
+
+**调查 Skill 和上下文装配。** 默认 v2 调查根据真实 Topic 事实加载一份内置排查指引。首轮的系统消息、任务输入和工具定义都可从快照回查。11 份真实历史请求离线对照三种策略、两档阈值，共 66 组消息、装配清单和估算值一致。默认阈值下装配 CPU 耗时中位数从 19.20 ms 降到 16.20 ms。 [首轮输入和装配对照](RobotOps_上下文管理.md#ros-1-自动调查的首次请求)
 
 **Redis 日志分页缓存。** 通过本机 TCP 连接系统 Redis 5.0.7，对同一份 200 行历史日志的两个分页分别走 SQLite 加原文文件和 SQLite 加 Redis 热命中，每条路径共 840 次。每批平均单次耗时的中位数由 1.621 ms 降到 0.757 ms，下降 53.3%。两条路径的输出和进展判断一致。停止独立实验进程后，从原文回读的结果也一致。 [缓存配置](../README.md#可选-redis-分页缓存)
 
 本地重新构建 Noetic 采集器后，全量回归 133 项通过，0 项跳过。
 
-## 0.5.0 本次交付
+### DeepSeek 首条消息超时实测
+
+2026-11-26 19:20（北京时间），隔离的 Noetic 发布节点在线，向 `/robotops_deepseek_fixture/output` 暂不发送消息。C++ 订阅 700 ms 后记录 `topic_startup_timeout` 并通过 Unix Socket 通知 Worker。真实 DeepSeek Flash 调查用了 **4 次请求，输入 12,061 Token、输出 1,567 Token，耗时 17.31 秒**。输入中命中模型缓存 6,528 Token。运行状态为 `COMPLETED`，报告为 `needs_human`。
+
+报告正确区分了 700 ms 的首条消息检测阈值和 1,000 ms 的契约静默上限。发布进程、上游输入和接收链路被列为待查假设，推荐补证。报告引用的 `ev-490fb36d2ee047b0a25475a75fc1eb14` 已按运行归属和哈希回查，原文 `last_message_at_ms=null`。两次案例检索为空，中途有一次回读空案例结果。连续三批取证没有新增观测后，第 4 轮只开放报告工具。报告还泛化提到了 QoS，当前 ROS 1 采集器提供的是消息到达事实，这一项属于待核验的泛化建议。
+
+真实模型只调查首条超时。调查结束后让节点开始发布再暂停，本机独立得到 `topic_silent`，静默 519 ms、阈值 500 ms，经本地回放与第一条事实分别保存。测试的两份 SQLite、报告和逐轮 Trace 位于本机 `data/ros1-startup-deepseek/20261126-112006-612912/`。 [逐轮请求与工具结果](RobotOps_上下文管理.md#deepseek-首条消息超时复跑)
+
+### 同场景修复复测
+
+首次报告对 700 ms 观测的结论成立。它回读已给出的触发事实、回读空案例并换词重查，也把 QoS 写成候选原因。修复后，Worker 用与检索共享的条件探测可用案例。无现场适配器、无适用案例且任务已带完整触发事实时，首轮只提供报告工具，模型接收的健康约束仅有输出静默上限。更新后的 Skill 按 ROS 1 Noetic 区分发布登记、实际连接和消息到达。
+
+| 同场景真实 DeepSeek Flash | 首次联调 | 最终复测 |
+|---|---:|---:|
+| 模型请求 | 4 | 1 |
+| 输入 Token | 12,061 | 2,093 |
+| 输出 Token | 1,567 | 1,138 |
+| 运行耗时 | 17.31 秒 | 5.94 秒 |
+
+2026-11-26 19:29（北京时间）的最终复测中，报告引用 `ev-a166e5f37ab540cf92939cfafd7243f1`，仍为 `needs_human`。核对原文确认为订阅后 700 ms 未收到首条消息，现有观测不足以判断后续输出是否超过 1,000 ms 的业务上限。模型按 ROS 1 的登记、连接和消息到达提出补证，相关报告正文通过用语核对。结果、快照和证据保存在本机 `data/ros1-startup-deepseek/20261126-112900-622064/`。此对照对应只有触发事实的场景。修复后 Noetic 全量 134 项通过、0 项跳过。
+
+## v0.5.0 发布记录
 
 | 范围 | 交付内容 |
 |---|---|
@@ -53,7 +76,8 @@ RobotOps 持续观测机器人应用，发现异常后留下现场记录，并�
 flowchart LR
     A["ROS 1 Topic"] --> B["C++ 观察消息是否到达"]
     B --> C[("ros-facts.db")]
-    C -->|"本机 Unix Socket 推送"| D["Python Worker 导入并去重"]
+    B -->|"落盘后通过 Unix Socket 推送"| D["Python Worker 导入并去重"]
+    C -->|"后台回放漏接事实"| D
     D --> E[("runtime.db<br/>事件与调查任务")]
     E --> F["Agent 调查"]
     F -->|"模型请求与工具结果循环"| G["工具网关与上下文装配"]
@@ -64,7 +88,7 @@ flowchart LR
 
 ### ① C++ 看到什么，实际落了哪一行
 
-采集器收到第一条消息后开始监测。静默达到阈值时，`ros-facts.db` 的 `topic_silences` 表写入这一行。两个时间戳是 Unix 毫秒，静默时长用单调时钟计算。
+在这次停发用例，收到第一条消息后开始监测。达到停发阈值时，`ros-facts.db` 的 `topic_silences` 写入这一行。两个时间戳是 Unix 毫秒，静默时长用单调时钟计算。首条消息超时也走同一张表，末条消息时间为空，`silent_ms` 从订阅起算。
 
 ```json
 {
@@ -162,7 +186,7 @@ Worker 用 `(source_id, sequence)` 去重，在一个事务里把事件和调查
 
 1. **发给模型。** 程序装配系统指令、事件、应用契约、适用的历史和记忆，并把可用工具的名称、用途和 JSON Schema 与消息一起发送。请求前先保存本轮快照。
 2. **模型选工具。** 例如，如果模型要核对触发事实，就返回 `read_evidence` 和证据 ID。每次工具请求都带调用 ID。
-3. **程序实际执行。** 网关核对工具白名单、参数类型、当前应用和证据范围。回取时按运行 ID 找原文并核对 SHA-256。日志查询有时间、关键词和条数限制，数据来源由程序确定。
+3. **程序实际执行。** 网关核对工具白名单、参数类型、当前应用和证据范围。原文读取按运行 ID 查归属和 SHA-256。日志分页可以复用此前已校验的 Redis 缓存。日志查询有时间、关键词和条数限制，数据来源由程序确定。
 4. **结果回给模型。** 新观测先保存原始响应并分配证据 ID，部分进程和指标结果可用精简视图回传。程序按原调用 ID 送回结果，模型再决定继续取证、更新记忆，或用 `submit_report` 结束。
 
 | 工具 | 实际作用 |
@@ -173,7 +197,7 @@ Worker 用 `(source_id, sequence)` 去重，在一个事务里把事件和调查
 | `read_evidence`、`retrieve_cases` | 按证据 ID 回读，日志支持按页和字段筛选。案例工具查找当前应用与版本适用的经验。 |
 | `update_working_memory`、`submit_report` | 在可用时保存带证据引用的工作记忆，或提交供后端校验的诊断报告。默认短调查直接交报告。 |
 
-**ROS 1 自动链路的实际取证范围。** 默认跑单 Agent，最多请求模型六次。触发的 Topic 事实已随任务送入，可回取该原文、查应用契约和适用案例。该 Worker 暂未接实时观测适配器，工具列表只公开可读的证据和案例入口以及报告提交。接了适配器的 Pipeline 示例可用这些现场工具。手动调查还支持主 Agent 用 `dispatch_investigation` 分派应用和系统检查，由子 Agent 用 `submit_finding` 提交发现并按角色共享证据。 [工具注册表和校验](../src/robotops/tools.py) · [模型与工具循环](../src/robotops/agent/graph.py) · [角色分工](../src/robotops/agent/supervision.py)
+**ROS 1 自动链路的实际取证范围。** 默认 v2 跑单 Agent，最多请求模型六次。应用契约和完整触发事实随任务发给模型，命中的 Skill 加入系统指令。Worker 缺少现场观测适配器时先按应用版本、组件和有效期检查案例。存在适用案例时开放 `read_evidence`、`retrieve_cases`、`submit_report`；当前资料只有触发事实时首轮交报告。实时进程、指标、日志和配置检查由接有适配器的调查使用，例如 UDP Pipeline。手动调查还支持主 Agent 用 `dispatch_investigation` 分派应用和系统检查，由子 Agent 用 `submit_finding` 提交发现并按角色共享证据。 [工具注册表和校验](../src/robotops/tools.py) · [模型与工具循环](../src/robotops/agent/graph.py) · [角色分工](../src/robotops/agent/supervision.py)
 
 ## 3. 上下文窗口、压缩和回查
 
@@ -254,7 +278,7 @@ Worker 用 `(source_id, sequence)` 去重，在一个事务里把事件和调查
 
 **第 17 轮，模型输出报告。** 报告状态是 `needs_human`，摘要是「仅做协议测试」，人工检查理由是「缺少当前实测」。Python 把它保存到 `runs.report`。前面查到的契约可以指出该去哪里取证，最终报告仍需要说明现场缺了哪些数据。
 
-第 7 轮从 6,528 字节的完整消息整理到 6,284 字节。第 3 轮候选视图更长，选择了 `full_fallback`，送出 3,936 字节的完整历史。字节比较只量消息。系统指令和工具定义在请求快照间共享，每条消息正文存一次，供应商实报的输入、输出及缓存 Token 另记在轨迹。 [多轮测试](../tests/test_g1.py#L482) · [上下文装配与快照](../src/robotops/agent/context.py)
+第 7 轮从 6,528 字节的完整消息整理到 6,284 字节。第 3 轮候选视图更长，选择了 `full_fallback`，送出 3,936 字节的完整历史。字节比较只量消息。系统指令和工具定义在请求快照间共享，每条消息正文存一次，供应商实报的输入、输出及缓存 Token 另记在轨迹。 [多轮测试](../tests/test_g1.py#L536) · [上下文装配与快照](../src/robotops/agent/context.py)
 
 #### 一条反证在多轮调查里怎么保留
 
@@ -287,7 +311,7 @@ Worker 用 `(source_id, sequence)` 去重，在一个事务里把事件和调查
 
 后续修复验证了分页新记录可推进调查、重复回读不延长调查，以及旧控制台日志不会改变当前实例。对同一批五份实测请求做离线回放，估算输入从 **108,484 降到 93,150 Token**。 后续优化后的本机 Noetic 全量回归为 127 项通过、0 跳过。 [重叠日志与证据归属](RobotOps_上下文管理.md#重叠日志与证据归属回归)
 
-Claude Code 会在接近窗口上限时自动压缩。Codex 的公开配置将自动压缩阈值和模型窗口分别提供给用户。RobotOps 当前采用单次调查中的规则裁剪，压缩量由回归数据测量。 [Claude Code 上下文机制](https://code.claude.com/docs/en/how-claude-code-works#when-context-fills-up) · [Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)
+RobotOps 单独配置裁剪触发线和模型总窗口。单次调查中的裁剪和归档由程序按规则执行，压缩量以保存的请求、估算和实报数据核对。 [窗口配置与裁剪顺序](RobotOps_上下文管理.md#6-m5-请求前的窗口裁剪)
 
 ## 4. 两个数据库在哪里，各存了什么
 
@@ -296,7 +320,7 @@ Claude Code 会在接近窗口上限时自动压缩。Codex 的公开配置将�
 | 谁创建 | 文件位置 | 位置由什么决定 |
 |---|---|---|
 | Python API、Worker 或其他运行入口初始化存储 | `data/runtime.db` | 默认数据目录是启动目录下的 `data/`，可经配置文件或 `ROBOTOPS_DATA_DIR` 指定。 |
-| C++ ROS 1 采集器启动 | `data/ros-facts.db` | 最后一个启动参数明确指定文件路径。README 示例传入 `data/ros-facts.db`。 |
+| C++ ROS 1 采集器启动 | `data/ros-facts.db` | `DATABASE` 位置参数指定写入路径。Python Worker 的 `--facts-db` 指向同一文件。 |
 
 前文的 Unix Socket 联调数据来自 pytest 的临时目录。运行 Noetic 联调用例可以重新生成两库、日志与报告。
 
@@ -313,7 +337,7 @@ ROS 触发事实通过证据 ID 回读 `ros_fact_tasks.fact`，新的触发证�
 
 | 位置 | 表 | 保存的内容 |
 |---|---|---|
-| **C++ `ros-facts.db`** | `source`、`topic_silences` | 来源 ID、应用、Topic；每条静默的序号、发现时间、末条消息到达时间、静默毫秒数和阈值。当前采集器仅跟踪到达时间。 |
+| **C++ `ros-facts.db`** | `source`、`topic_silences` | 来源 ID、应用和 Topic。观测行保存序号、发现时间、末条消息到达时间、等待或静默毫秒数和阈值。首条消息超时的末条消息时间为 `NULL`。 |
 | **Python `runtime.db`** | `applications`、`incidents`、`ros_fact_tasks`、`runs` | 应用契约；异常症状、来源和状态；触发事实 JSON、副本对应的来源和序号、已关联的调查；每次调查的模型、状态、起止时间、报告正文或错误。 |
 | **Python `runtime.db`** | `evidence`、`memories`、`context_snapshots`、`context_inputs`、`context_messages` | 证据的运行和事件归属、工具来源、时间、SHA-256；工作记忆每个版本的正文；每轮请求的消息与工作记忆引用、装配清单、工具与系统指令引用、序号和哈希，可重组为完整 JSON。 |
 | **Python `runtime.db`** | `cases`、`cases_fts` | 历史案例正文、应用与版本，以及全文检索索引。 |
@@ -327,6 +351,8 @@ Python 数据目录还保存三个目录下的文件。数据库用 ID 串起这
 | `traces/<运行 ID>.jsonl` | 每轮模型请求的快照编号、校验后的回复、工具参数和结果索引、错误及供应商返回的 Token 用量。 |
 | `executions/<启动记录 ID>.log` | 由 Python 启动入口运行的普通命令或 ROS 1 launch 的标准输出和标准错误。 |
 
+启用 Redis 时，日志分页的模型视图和进展计算所需数据可缓存 300 秒。SQLite 继续保存证据索引和权威哈希，完整原文通过原始证据接口回查。 [分页链路](RobotOps_上下文管理.md#模型回读原始证据)
+
 API 侧从 `GET /incidents/{id}` 可看到触发事实和自动调查的运行 ID。用 `GET /runs/{run_id}` 查报告，用 `/evidence/{evidence_id}`、`/contexts/{sequence}`、`/memory`、`/trace` 或 `/usage` 接在运行 URL 后查看原文、请求输入、记忆、轨迹和用量。 [启动与查询方式](../README.md#用-ros-1-topic-触发自动调查) · [SQLite 表与文件读写](../src/robotops/storage.py)
 
 ## 5. ROS 1 故障怎么恢复
@@ -335,7 +361,7 @@ RobotOps 根据观测类型分流。下面用相机举例。
 
 - **单个普通节点退出。** 已配置 `respawn="true"` 的节点由原 `roslaunch` 拉起。RobotOps 保留它的退出码和故障前的控制台输出。
 - **整条 launch 异常结束。** 用户运行 `robotops run --restart-on-exit camera -- roslaunch camera_driver camera.launch` 时，Runner 获准按原参数重启一次。触发条件是 launch 非零退出，或本机必需节点非零退出并导致这次 launch 结束。启动范围由这个 launch 文件定义。
-- **进程还在，Topic 停发。** C++ 把观测推给 Python，Worker 自动建任务并让 Agent 调查。有了确切故障依据以后，再决定处置目标。
+- **进程还在，Topic 首条消息超时或停发。** C++ 把观测推给 Python，Worker 自动建任务并让 Agent 调查。报告按当前证据说明现象和下一项待查内容。
 
 一次重启的记录可以从 `GET /incidents/{id}` 直接读到。`execution_exit.execution_id` 指向故障前的旧启动和日志，`launch_restart.execution_id` 指向新的启动。Runner 等 ROS 报告启动完成，再观察 5 秒。通过记为 `STABLE`，提前退出记为 `FAILED`，验收中操作员停止记为 `INTERRUPTED`。`STABLE` 只说明新 launch 通过了进程级验收，原故障继续保留供调查。
 
@@ -394,13 +420,14 @@ API 仍从原故障查 `launch_restart`。外层 `state` 是进程验收，`topi
 | 能力 | 当前实际进度 |
 |---|---|
 | **M1 只读调查、M2 应用接入与退出监测** | 支持有证据引用的报告，支持普通程序、ROS 1 launch 和已登记 systemd 服务的异常退出接入。退出事件可从 API 发起调查。 |
-| **M3a 自动调查** | C++ 写入 Noetic Topic 静默事实后主动推送，Python 自动建事件和派发调查。触发事实正文在 Python 任务表内保存一次，报告按证据 ID 回查。 |
+| **M3a 自动调查** | C++ 写入 Noetic 首条消息超时或停发事实后主动推送，Python 经实时通知或回放后去重、派发。触发事实可按报告中的证据 ID 回查。 |
 | **M3b 受控恢复** | ROS 1 Runner 支持显式允许的一次 launch 重启，并记录新实例的进程级验收。systemd 的旧动作仅用于历史回查。 |
 | **M4 业务验收** | ROS 1 launch 重启后检查指定 Topic 的持续新消息。通过时关闭关联退出事件，回执与观测摘要可随原事件回查。 |
 | **M5 窗口管理** | 已接入输入预算、输出预留、分层裁剪、裁剪后复核和超限收尾。用量记录可对照每轮的估算、实报输入、缓存与供应商超限重试。 |
+| **日志分页与 Skill** | 网关按需使用 Redis 缓存已校验的分页。ROS 1 触发调查按事实类型加载 Skill，名称和指纹随 Trace 保存。 |
 
 本地回归覆盖真实 Noetic 的 Unix Socket 自动调查、一次重启成功和重启后仍失败。真实 ROS 观测用于验证感知、派发、报告协议和落盘链路。已有 DeepSeek UDP 对照用于验证处理停滞的工具选取和证据链。0.4.0 的 ROS 1 自动端到端结果见文首。默认短单 Agent 调查关闭记忆写入，完整日志复用已经查过的时段。 [评测入口](../README.md#测试与实验) · [上下文管理](RobotOps_上下文管理.md)
 
 分页优化前的默认阈值长日志实测验证了裁剪后速率、在途耗时和原文回读。真实模型定位了处理端停滞，提交 `needs_human`，基准 4/5。 [逐轮估算与实报用量](RobotOps_上下文管理.md#默认阈值长日志校准)
 
-本轮窗口优化后，普通环境有 116 项通过、8 项 Noetic 联调用例跳过。加载 Noetic 并提供已构建采集器后，本机全量回归为 124 项通过、0 跳过。可选工作流会按零跳过校验。 [测试入口](../README.md#测试与实验)
+当前回归以已构建采集器和已加载 Noetic 的环境为准。`b0733ac` 全量 133 项通过、0 项跳过。可选 Noetic 工作流也按零跳过校验。 [测试入口](../README.md#测试与实验)

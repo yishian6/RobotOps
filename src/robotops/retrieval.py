@@ -15,6 +15,22 @@ from pydantic import AwareDatetime, Field, model_validator
 from .models import Identifier, Model, utc_now
 from .storage import Store
 
+# Keep the initial tool availability check and actual searches on the same eligibility rules.
+_CASE_APPLICABILITY = """
+    c.app_id=? AND c.app_version=?
+    AND json_extract(c.body, '$.enabled')=1
+    AND julianday(json_extract(c.body, '$.verified_at'))<=julianday(?, 'unixepoch')
+    AND (json_extract(c.body, '$.valid_until') IS NULL OR
+        julianday(json_extract(c.body, '$.valid_until'))>julianday(?, 'unixepoch'))
+    AND NOT EXISTS (SELECT 1 FROM json_each(c.body, '$.components') x
+        WHERE x.value NOT IN (SELECT value FROM json_each(?)))
+"""
+
+
+def _applicability_parameters(contract: dict) -> tuple:
+    now = datetime.now(timezone.utc).timestamp()
+    return contract["app_id"], contract["version"], now, now, json.dumps(contract["components"])
+
 
 def search_terms(text: str) -> list[str]:
     """
@@ -157,6 +173,14 @@ class CaseLibrary:
             )
         return body
 
+    def has_applicable_cases(self, contract: dict) -> bool:
+        """Check whether any case is eligible before offering keyword search to the model."""
+        with self.store.connection() as db:
+            return db.execute(
+                f"SELECT 1 FROM cases c WHERE {_CASE_APPLICABILITY} LIMIT 1",
+                _applicability_parameters(contract),
+            ).fetchone() is not None
+
     def search(self, contract: dict, query: str, components: list[str] | None = None, limit=5):
         """
             只返回当前契约可用的已验证案例；空查询返回空，不退回全库灌入上下文。
@@ -183,36 +207,19 @@ class CaseLibrary:
             return []
         # 只拼接正则提取的词项并逐词加引号；原始引号、OR/NOT 或括号不能成为 FTS 操作语法。
         match = " OR ".join('"' + term + '"' for term in terms)
-        # 两个有效期谓词共用一个当前时刻，避免恰好跨过边界时得到自相矛盾的筛选条件。
-        now = datetime.now(timezone.utc).timestamp()
         # 时间使用 julianday 比较，兼容外部输入中的不同时区偏移；未来验证也不生效。
         # 先做版本、验证时间、有效期和组件适用过滤，再 LIMIT，避免无效案例占满候选名额。
         # 组件须全部属于当前契约；可选焦点只需与案例组件相交，两者约束不能互相替代。
         # NOT EXISTS 排除含任何未知组件的案例；EXISTS 仅要求与可选焦点相交。
         # bm25 分值越小越相关，ID 作为同分次序，确保限制条数下的返回顺序稳定。
+        focus_json = json.dumps(focus)
         with self.store.connection() as db:
             rows = db.execute(
-                """SELECT c.body FROM cases_fts f JOIN cases c ON c.id=f.case_id
-                WHERE cases_fts MATCH ? AND c.app_id=? AND c.app_version=?
-                AND json_extract(c.body, '$.enabled')=1
-                AND julianday(json_extract(c.body, '$.verified_at'))<=julianday(?, 'unixepoch')
-                AND (json_extract(c.body, '$.valid_until') IS NULL OR
-                    julianday(json_extract(c.body, '$.valid_until'))>julianday(?, 'unixepoch'))
-                AND NOT EXISTS (SELECT 1 FROM json_each(c.body, '$.components') x
-                    WHERE x.value NOT IN (SELECT value FROM json_each(?)))
+                f"""SELECT c.body FROM cases_fts f JOIN cases c ON c.id=f.case_id
+                WHERE cases_fts MATCH ? AND {_CASE_APPLICABILITY}
                 AND (?='[]' OR EXISTS (SELECT 1 FROM json_each(c.body, '$.components') x
                     WHERE x.value IN (SELECT value FROM json_each(?))))
                 ORDER BY bm25(cases_fts), c.id LIMIT ?""",
-                (
-                    match,
-                    contract["app_id"],
-                    contract["version"],
-                    now,
-                    now,
-                    json.dumps(contract["components"]),
-                    json.dumps(focus),
-                    json.dumps(focus),
-                    limit,
-                ),
+                (match, *_applicability_parameters(contract), focus_json, focus_json, limit),
             ).fetchall()
         return [json.loads(row[0]) for row in rows]

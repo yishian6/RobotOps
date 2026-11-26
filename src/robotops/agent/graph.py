@@ -156,6 +156,7 @@ class InvestigationGraph:
             instruction = {
                 "model_call_budget": " 本轮是最后一次模型请求。",
                 "no_progress": " 连续查询未获得新线索，请结束调查。",
+                "no_available_observations": " 触发证据已随任务给出。当前没有适用的历史案例或可补采的现场工具。",
                 "context_window": " 上下文已达到工作窗口，请结束调查。",
             }.get(reason, "")
             return [{**tool, "function": {
@@ -172,6 +173,8 @@ class InvestigationGraph:
             closing = "context_window" if retry_limit is not None else recovery.failed_tool
             if not accepted:
                 closing = "context_window" if retry_limit is not None else "model_call_budget"
+            elif closing is None and len(tools) == 1:
+                closing = "no_available_observations"
             elif closing is None and recovery.stalled_rounds >= MAX_STALLED_ROUNDS:
                 closing = "no_progress"
             elif closing is None and budget["remaining"] == budget["reserved_for_parent_report"]:

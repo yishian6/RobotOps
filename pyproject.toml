@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robotops-agent"
-version = "0.5.0"
+version = "0.5.1"
 description = "Evidence-driven application incident investigation, starting with a local runtime."
 requires-python = ">=3.11"
 dependencies = [

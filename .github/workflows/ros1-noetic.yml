@@ -1,23 +1,33 @@
 name: ROS 1 Noetic regression
 
 "on":
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: noetic-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   noetic:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.13.9"
-      - name: Build collector and run all tests
+      - name: 构建采集器并运行全部测试
         run: |
           docker run --rm -i \
             --volume "$GITHUB_WORKSPACE:/workspace" \
