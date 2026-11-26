@@ -1,0 +1,74 @@
+name: Release
+
+"on":
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.9"
+          enable-cache: true
+      - name: Verify the tag is merged into main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$sha" --jq .status)"
+          case "$status" in
+            behind|identical) ;;
+            *)
+              echo "The release tag $GITHUB_REF_NAME points to $sha, which is not merged into main (status: $status)." >&2
+              exit 1
+              ;;
+          esac
+      - name: Verify package versions
+        run: |
+          uv lock --check
+          python3 - "$GITHUB_REF_NAME" <<'PY'
+          import runpy
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          tag = sys.argv[1]
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          runtime = runpy.run_path("src/robotops/__init__.py")["__version__"]
+          if tag != f"v{project['version']}" or runtime != project["version"]:
+              raise SystemExit(f"Tag {tag}, package {project['version']} and runtime {runtime} must agree.")
+          PY
+      - name: Re-run fast checks on the tagged commit
+        run: |
+          uv sync --locked --extra dev
+          uv run --no-sync ruff check src tests benchmarks examples config .github/scripts
+          uv run --no-sync robotops check-prompts
+          uv run --no-sync pytest -q -rs
+      - name: Build and verify release artifacts
+        run: |
+          bash .github/scripts/build_and_verify_package.sh "$RUNNER_TEMP/robotops-release"
+          cd "$RUNNER_TEMP/robotops-release"
+          sha256sum -- *.whl *.tar.gz > SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/robotops-release"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "RobotOps $GITHUB_REF_NAME" --generate-notes \
+            *.whl *.tar.gz SHA256SUMS

@@ -1,18 +1,19 @@
 # RobotOps 上下文管理
 
-这里说明现行代码每轮读取、发送和保存的数据。第 1–5 节的实测示例取自 2026-11-24 20:30（北京时间）的 DeepSeek Flash 调查，第 6 节记录 M5 的请求窗口与回归。
+本文适用 `dev_zjh` 0.5.1，说明每轮读取、发送和保存的数据。实测保留各自的版本与场景，覆盖 11 月 24 日的 DeepSeek Flash 短调查、11 月 25 日的长日志调查，以及 Noetic 首条消息超时联调和本机 Redis 对照。
 
 ## 1. 从故障进入模型
 
 以隔离 UDP 示例为例，初始消息带三组信息。
 
 - **系统指令** 只读调查，区分证据支持与待查情况，通过 `submit_report` 提交。
-- **任务数据** 应用 `pipeline`，症状「数据处理链路没有持续输出」，组件 `producer`、`processor`。契约给出最低输入速率 5 Hz、输出静默上限 1 秒和组件依赖。ROS 自动调查还会带上 Topic 静默事实和证据引用。
+- **任务数据** 应用 `pipeline`，症状「数据处理链路没有持续输出」，组件 `producer`、`processor`。契约给出最低输入速率 5 Hz、输出静默上限 1 秒和组件依赖。
 - **工具定义** 函数名、用途、参数 Schema。默认 v2 短单 Agent 调查直接使用任务里的契约，禁用记忆写入。层级模式或显式扩大请求预算的调查可以使用工作记忆。
 
 ```mermaid
 flowchart TD
     I["事件、应用契约、触发观测"] --> A["装配下轮请求"]
+    K["系统指令与匹配的排查 Skill"] --> A
     T["工具定义"] --> A
     A --> S["保存请求快照"]
     A --> M["DeepSeek"]
@@ -23,6 +24,35 @@ flowchart TD
     H --> A
     M -->|"submit_report"| R["校验后将报告写入 SQLite"]
 ```
+
+### ROS 1 自动调查的首次请求
+
+首条消息超时的早期 Noetic 联调中，`camera` 的 `/smoke/output` 被订阅满 700 ms 仍未送达首条消息。C++ 保存事实并推送，Python 为它创建调查和证据 ID。该次快照第 1 轮有两条消息和三个工具定义。
+
+| 请求部分 | 当次内容摘录 |
+|---|---|
+| `system` 消息 | 基础只读指令和 `ros1-topic-silence` Skill。指引要求区分订阅起算的首条消息超时与末条消息起算的停发。 |
+| `user` 消息 | `camera` 的应用契约和故障任务，`incident.ros_fact` 包含 `kind=topic_startup_timeout`、`topic=/smoke/output`、`sequence=1`、`silent_ms=700`、`threshold_ms=700`、`last_message_at_ms=null` 和本次调查的 `evidence_id`。 |
+| 当次工具定义 | `read_evidence`、`retrieve_cases`、`submit_report`。ROS Worker 以采集事实作为现场输入，进程、指标和实时日志工具由接入观测适配器的其他调查使用。 |
+
+这次测试用固定模型响应直接交付 `needs_human` 报告，报告引用上一行的触发证据。`/trace` 的 `prompt` 事件保留 Skill 名称和 SHA-256，快照中的系统消息可回查当轮实际生效的指引。Skill 只匹配经采集链路入库的两种事实类型。随后首条消息到达，下一段静默又生成序号 2 的 `topic_silent`，末条消息时间有值。 [真实联调用例](../tests/test_ros_facts.py) · [阶段汇报](RobotOps_当前版本汇报.md#050-发布后的开发验证)
+
+现在默认 v2 的事实 Worker 会先从 SQLite 检查是否有适用且已验证的案例。有适用案例时仍提供三个工具。缺少观测适配器且输入已有完整触发事实时，仅在无适用案例的情况下首轮只开放 `submit_report`，快照记录 `report_only=no_available_observations`。这条路径的模型任务只带输出静默上限，完整契约仍在 SQLite。适用条件与实际检索共用。 [案例筛选](../src/robotops/retrieval.py) · [调查入口](../src/robotops/agent/workflow.py)
+
+### DeepSeek 首条消息超时复跑
+
+2026-11-26 19:20（北京时间），用隔离的 `/robotops_deepseek_fixture/output` 和真实 DeepSeek Flash 重跑。首轮仍是系统指令（含 `ros1-topic-silence`）、任务和三个工具定义。任务里的 C++ 事实记录 `kind=topic_startup_timeout`、`last_message_at_ms=null`、`silent_ms=700`。应用契约里的输出静默上限是 1 秒。
+
+| 轮次 | 模型动作与工具结果 | 估算输入 | 实报输入 / 输出 |
+|---|---|---:|---:|
+| 1 | 回读触发观测，查匹配案例。观测已在首次任务中，案例集为空 | 4,096 | 2,466 / 133 |
+| 2 | 回读第 1 轮的案例证据，确认仍是空集合 | 4,740 | 3,038 / 132 |
+| 3 | 换关键词检索发布进程和节点启动相关案例，仍为空 | 5,195 | 3,407 / 120 |
+| 4 | 连续三批无新观测，工具目录只余 `submit_report`。模型区分了两种阈值，保留根因待查，引用触发证据交付报告 | 4,752 | 3,150 / 1,182 |
+
+四轮实报共 12,061 输入 Token、1,567 输出 Token，其中模型缓存命中 6,528 输入 Token。此次没有触发窗口压缩。第 2、3 轮的空案例回读和再次检索没有增加线索，最后由无进展守卫限制收尾。这个单次结果验证首条消息超时数据能进入真实模型并形成可校验报告。 [阶段汇报](RobotOps_当前版本汇报.md#deepseek-首条消息超时实测)
+
+修复后同场景最终复测只有一轮。请求仍包含系统消息和任务消息，工具定义只有 `submit_report`。任务内的 `contract.health` 实际为 `{"max_output_silence_seconds": 1.0}`。估算输入 3,489 Token，实报输入 2,093、输出 1,138，模型缓存命中 384。报告通过了原始证据回查，并将结论限定在观测窗口内。 [修复复测对照](RobotOps_当前版本汇报.md#同场景修复复测)
 
 ## 2. 工具怎么产生新的信息
 
@@ -42,9 +72,9 @@ flowchart TD
 ## 3. 每轮实际给模型什么
 
 1. `assemble` 取系统指令、任务、已发生的助手消息和工具回传，以及可用的工作记忆。
-2. 默认 `evidence` 保留最新一批完整工具往返。更早的日志可聚合，已归纳或重复的证据可用引用。保护中的关键证据和反证继续保留。
-3. 比较候选与原消息数组的 UTF-8 字节数。候选更大就发送完整历史。工具符号和 Schema 独立于消息数组发送。
-4. 发送前记录准确快照。模型输出后存公开正文与工具调用。报告工具成功时结束，最后回执只在 Trace，不再请求模型。
+2. 默认 `evidence` 保留最近一批工具请求和回复的配对。日志分页已出现的行和字段可以去重，更早的日志可聚合，已归纳或重复的证据可用引用。关键证据和反证按正文预算保留。
+3. 常规装配比较候选与保留历史视图的 UTF-8 字节数，保留较小视图。随后把工具 Schema 一起计入输入估算，必要时按窗口规则进一步裁剪。
+4. 发送前保存最终请求的快照。模型响应后存公开正文与工具调用。报告通过校验后结束，最终回执留在 Trace。
 
 20:30 实测四轮都发送了完整历史，第 3、4 轮整理候选更大。第 4 轮收到 11 条消息和 7 个工具定义，消息数组为 11,710 B，供应商实报输入为 5,428 Token。两者计量口径不同。 [装配实现](../src/robotops/agent/context.py)
 
@@ -59,7 +89,8 @@ flowchart TD
 | 写入内容 | 位置 | 如何查 |
 |---|---|---|
 | 原始工具观测 | `runtime.db` 的 `evidence` 保存索引，普通原文放在 `evidence/<证据编号>.json` | `GET /runs/{id}/evidence/{eid}` |
-| ROS 触发事实 | `runtime.db` 的 `ros_fact_tasks.fact`，按证据索引读取 | 同一证据接口 |
+| ROS 触发事实 | C++ 先写 `ros-facts.db` 的 `topic_silences`；Python 导入 `runtime.db` 的 `ros_fact_tasks.fact`，运行证据索引指回任务正文 | 事件详情及同一证据接口 |
+| 可选日志分页缓存 | Redis 保留已校验的分页响应和本次分页的进展计算所需数据，条目 300 秒过期 | 由工具网关使用，审计证据接口直接查原文 |
 | 工作记忆 | `memories` 按运行和版本存正文 | `GET /runs/{id}/memory` |
 | 各轮真实请求 | `context_snapshots` 存顺序、引用、清单与哈希，正文在 `context_messages`，系统指令与工具定义在 `context_inputs` | `GET /runs/{id}/contexts/{sequence}` |
 | 模型回复、工具和实报用量 | `traces/<运行编号>.jsonl`，工具参数由同轮模型响应追溯 | `GET /runs/{id}/trace`、`GET /runs/{id}/usage` |
@@ -73,7 +104,7 @@ flowchart TD
 
 `trace` 的 `model_budget` 事件记录每次额度申请是否获准、总额度、已占用和剩余额度，以及收尾原因。请求快照清单保存同一轮的额度与连续无进展批数。`/usage` 的 `model_budget` 汇总这些记录，供应商实报用量仍在原有字段。额度在组装请求前占用，因此即使快照写入失败，也可区分已占额度和实际模型回包。 [用量汇总](../src/robotops/agent/usage.py)
 
-ROS 1 自动调查的新实测从停机期间落盘的 Topic 事实开始，输入 7,405 Token、输出 2,177 Token，三轮交付引用原始观测的 `needs_human` 报告。 [回放触发的自动实测](RobotOps_当前版本汇报.md#040-自动-topic-实测)
+`v0.4.0` 的 ROS 1 自动调查实测从停机期间落盘的 Topic 停发事实开始，输入 7,405 Token、输出 2,177 Token，三轮交付引用原始观测的 `needs_human` 报告。 [回放触发的自动实测](RobotOps_当前版本汇报.md#040-自动-topic-实测)
 
 同期独立 UDP 取证实测中第 4 轮交报告，状态为 `proposed`，五项评估通过。报告定位到已进入处理流程的一条样本持续未完成，建议人工检查线程栈和通道。
 
@@ -92,7 +123,7 @@ ROS 1 自动调查的新实测从停机期间落盘的 Topic 事实开始，输�
 
 每轮估算消息正文、原生工具参数、当轮工具 Schema 和协议开销。官方 DeepSeek Flash 使用历史实报校准。在 RobotOps 的文本和工具输入中，约每两个 ASCII 字符估为 1 Token，其他字符按每字符 1 Token，再加协议余量。校准样本共 25 次请求，估算在实报的 1.21–1.76 倍之间。未知端点继续用保守的 UTF-8 字节代理，快照注明计量方式。实际用量以模型的 `prompt_tokens` 为准。 [DeepSeek 的 Token 计量](https://api-docs.deepseek.com/quick_start/token_usage/)
 
-估算超过 **131,072 输入 Token** 时启动裁剪，可用 `ROBOTOPS_CONTEXT_COMPACT_AFTER_TOKENS` 调整。官方 DeepSeek Flash 总窗口为 1,048,576 Token，RobotOps 使用非思考模式，发送请求时默认省略 `max_tokens`。可用输入上限是总窗口减去服务端生成额度或显式设置的 `ROBOTOPS_MODEL_OUTPUT_TOKENS`。自定义端点可用 `ROBOTOPS_CONTEXT_WINDOW_TOKENS` 声明总窗口。总窗口未知时，输入阈值也作为本地上限。 [DeepSeek 模型容量](https://api-docs.deepseek.com/api/list-models/) · [生成参数](https://api-docs.deepseek.com/api/create-chat-completion/)
+估算超过 **131,072 输入 Token** 时启动裁剪，可用 `ROBOTOPS_CONTEXT_COMPACT_AFTER_TOKENS` 调整。模型输入硬上限另算，总窗口扣掉生成额度。`b0733ac` 对官方 DeepSeek Flash 按总窗口 1,048,576 和非思考模式默认生成额度 8,192 计算，得到 1,040,384 的本地输入硬上限。实际请求默认省略 `max_tokens`，生成额度由服务端决定。显式设置 `ROBOTOPS_MODEL_OUTPUT_TOKENS` 时同时用于请求参数和硬上限计算。自定义端点可用 `ROBOTOPS_CONTEXT_WINDOW_TOKENS` 声明总窗口，未声明窗口时以裁剪阈值作为本地上限。 [窗口配置实现](../src/robotops/config.py) · [生成参数](https://api-docs.deepseek.com/api/create-chat-completion/)
 
 | 顺序 | 请求内容如何变化 |
 |---|---|
@@ -113,7 +144,9 @@ ROS 1 自动调查的新实测从停机期间落盘的 Topic 事实开始，输�
 
 例如 `read_evidence(evidence_id=id, offset=0, limit=20, fields=["component", "telemetry"])` 会回读同一证据，返回日志前一页，顺带保留可用的时间和实例。日志默认最多 20 条，最多可请求 50 条，同时受 16 KiB 紧凑数据正文预算限制。下一页用 `next_offset`。超长行位置记在 `omitted_rows`，可用更窄字段复查结构化记录。非日志证据通常一次给出，较大的观测支持指定顶层字段。
 
-工具回读返回原证据 ID 和原文校验哈希。审计接口 `GET /runs/{id}/evidence/{evidence_id}` 可查看完整原文。连续取到不同日志行会推进调查，重复回读同一批行不会延长调查。进展检查复用本次网关读取的已校验原文，按实际出现在工具回复中的行计算，跳过只有占位的超长行。 子调查仅返回证据引用时，主调查在实际回读后才登记已看过的日志行。 [工具入口](../src/robotops/tools.py)
+工具回读返回原证据 ID 和原文校验哈希。审计接口 `GET /runs/{id}/evidence/{evidence_id}` 可查看完整原文。进展按本页展示内容对应的原始日志行计算，跳过仅有占位的超长行。同一行改用其他字段回读仍按原行识别，新字段可以出现在模型收到的消息中。子调查只返回证据引用时，主调查在实际回读后才登记已查看的日志行。 [工具入口](../src/robotops/tools.py)
+
+启用 Redis 时，网关先核对角色权限和 SQLite 的运行归属，再按原文哈希、文件身份和分页参数读取缓存。命中沿用原证据身份、分页响应和参与进展判断的数据。未命中、文件变化或连接失败时回到原文读取及 SHA-256 校验。Redis 加速的是同一页的本地读取，送给模型的消息和 Token 估算沿用同一分页视图。本机 200 行日志热命中的耗时见阶段汇报。 [缓存配置](../README.md#可选-redis-分页缓存) · [回读实现](../src/robotops/tools.py)
 
 ### 长调查离线回归
 
@@ -197,3 +230,14 @@ ROS 1 自动调查的新实测从停机期间落盘的 Topic 事实开始，输�
 同一模型请求里，后来的原生工具回复只省略已经在更早回复中出现的相同证据行和字段。保留下来的行用 `page.row_indices` 标明在原证据中的位置，`page.next_offset` 继续沿用原始分页游标。新增字段仍会发送。只有实时进程检查和指标采样可以更新当前实例，旧控制台日志保留为旧现场证据。报告的首个样本断言按它提到的组件、可识别的实例和引用证据校验。
 
 用上一次 UDP 实测保存的五份请求做离线对照，晚段页的 20 条里有 19 条已出现在首次预览。第 4、5 轮分别只保留索引 180 的新行。五轮输入估算从 108,484 降到 93,150 Token，减少 14.1%。对照数据位于 `data/m5-log-preview-20261125-134535-408562/overlap-replay.json`。
+
+### 发布后的装配性能回归
+
+`b0733ac` 跳过不会参与证据归档的分诊记忆投影，缺少实时组件实例时跳过旧实例比较，并用批量 ASCII 计数计算混合文本的估算值。以 11 份保存的真实请求、三种策略、两档阈值进行离线对照，共 66 组交付的消息、装配清单和估算值逐项一致。 [装配实现](../src/robotops/agent/context.py)
+
+| 输入裁剪阈值 | 优化前本机 CPU 耗时中位数 | 优化后 |
+|---|---:|---:|
+| 默认 131,072 | 19.20 ms | 16.20 ms |
+| 压力对照 12,000 | 37.64 ms | 26.04 ms |
+
+这组结果衡量请求发送前的本地装配 CPU 时间。日志分页 Redis 实验衡量网关回读耗时。上面的 DeepSeek 实测用于说明模型实际消耗的 Token。

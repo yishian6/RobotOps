@@ -99,7 +99,9 @@ def test_cases_filter_before_limit_and_preserve_provenance(investigation):
         {"verified_at": datetime.now(timezone.utc) + timedelta(days=1)},
     ):
         library.add(CaseCreate(**case_body(**changes)))
+    assert not library.has_applicable_cases(contract.model_dump())
     valid = library.add(CaseCreate(**case_body()))
+    assert library.has_applicable_cases(contract.model_dump())
     found = library.search(contract.model_dump(), "输入断流", limit=1)
     assert [row["id"] for row in found] == [valid["id"]]
     assert library.get(valid["id"])["source_uri"] == "fixture:verified-runbook"
@@ -121,6 +123,7 @@ def test_cases_filter_before_limit_and_preserve_provenance(investigation):
     assert store.read_evidence(run_id, result["evidence_id"])["raw"]["data"] == result["data"]
     # 撤回只影响后续检索；旧调查的来源快照仍保留当时内容，不能随当前案例状态被改写。
     library.disable(valid["id"])
+    assert not library.has_applicable_cases(contract.model_dump())
     assert library.search(contract.model_dump(), "断流") == []
     assert store.read_evidence(run_id, result["evidence_id"])["raw"]["data"]["cases"][0]["enabled"]
 

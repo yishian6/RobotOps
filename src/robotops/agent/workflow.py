@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from ..config import Config, ContextWindow
 from ..models import DiagnosticReport
 from ..observations import ObservationSource
+from ..retrieval import CaseLibrary
 from ..storage import Store
 from ..tools import DIRECT_OBSERVATION_TOOLS, ToolGateway, tool_definitions
 from .client import ModelError
@@ -211,6 +212,18 @@ def investigate(
         )
         incident, evidence_id = _with_trigger_evidence(store, run_id, incident)
         initial_evidence = (evidence_id,) if evidence_id is not None else ()
+        # With only the fully supplied ROS trigger and no applicable cases, no tool can add evidence.
+        trigger_only = (
+            automatic and observer is None and evidence_id is not None and mode == "single"
+            and prompt.version != "investigation/v1"
+            and not CaseLibrary(store).has_applicable_cases(contract)
+        )
+        model_contract = contract
+        if trigger_only:
+            # Input-rate requirements do not describe this output Topic observation.
+            health = contract.get("health", {}).copy()
+            health.pop("min_input_hz", None)
+            model_contract = {**contract, "health": health}
         skill = (
             load_incident_skill(incident)
             if enable_skills and prompt.version != "investigation/v1" else None
@@ -218,7 +231,7 @@ def investigate(
         if skill:
             report_instruction += "\n\n" + skill[0]
         messages, metadata = investigation_messages(
-            incident, contract, prompt, report_tool_instruction=report_instruction,
+            incident, model_contract, prompt, report_tool_instruction=report_instruction,
         )
         if skill:
             metadata["skill"] = skill[1]
@@ -251,6 +264,8 @@ def investigate(
                 omitted.add("update_working_memory")
         if automatic and observer is None:
             omitted.update(DIRECT_OBSERVATION_TOOLS)
+        if trigger_only:
+            omitted.update({"retrieve_cases", "read_evidence", "update_working_memory"})
         tools = [tool for tool in tools if tool["function"]["name"] not in omitted]
         report = graph.run(
             messages, [*tools, report_tool], execute,
