@@ -128,6 +128,12 @@ def create_app(
             "model_configured": bool(config.api_key),
             "prompt": prompt.metadata,
             "context_strategy": config.context_strategy,
+            "context_window": {
+                "compact_after_tokens": config.context_window.compact_after_tokens,
+                "total_tokens": config.context_window.total_tokens,
+                "input_limit_tokens": config.context_window.input_limit_tokens,
+                "model_output_override_tokens": config.model_output_tokens,
+            },
             "investigation_modes": list(INVESTIGATION_MODES),
             "default_investigation_mode": DEFAULT_API_MODE,
             "supervision_prompt": {"version": ROLE_PROMPT_VERSION, "sha256": role_prompts.sha256},
@@ -341,6 +347,7 @@ def create_app(
             mode=mode,
             role_prompts=role_prompts,
             branch_timeout_seconds=config.branch_timeout_seconds,
+            context_window=config.context_window,
         )
 
     @app.get("/runs/{run_id}")

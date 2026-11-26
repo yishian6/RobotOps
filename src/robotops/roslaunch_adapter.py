@@ -108,7 +108,7 @@ def launch(argv, events):
     roslaunch.write_pid_file(options.pid_fn, options.core, options.port)
     try:
         launcher.start()
-        send_event({"type": "started"})
+        send_event({"type": "started", "master_uri": launcher.config.master.uri})
         launcher.spin()
     finally:
         launcher.shutdown()

@@ -1,6 +1,6 @@
 # RobotOps 项目阶段汇报
 
-**状态日期** 2026 年 11 月 24 日
+**状态日期** 2026 年 11 月 25 日
 
 RobotOps 持续观测机器人应用，发现异常后留下现场记录，并在适用的场景中自动发起调查。在本机 ROS 1 Noetic 上，已跑通完整链路：发布节点仍在线，Topic 停发，系统自动建事件、派任务、生成一份可以回查原始观测的诊断报告。当前采集链路使用本机 Unix Socket，由 C++ 在写入现场事实后主动推送给 Python。
 
@@ -258,21 +258,13 @@ Worker 用 `(source_id, sequence)` 去重，在一个事务里把事件和调查
 
 版本 2 的输入把阶段更新成 `reporting`，提交的假设列表为空。输出的新记忆版本里，两条证据 ID 仍都在 `protected_ids`，完整的版本 1 也还在库里。较早的工具回复进入历史整理时，这两个 ID 会按受保护证据处理，原始数据也可按 ID 回查。 [反证保护测试](../tests/test_g1.py) · [工作记忆写入](../src/robotops/agent/memory.py)
 
-### 模型窗口怎么管，M5 待评测的设计
+### M5 请求前的模型窗口管理
 
-**128K 可以是某个模型的一轮总窗口。** 实际上限由选用的模型和服务端决定。系统指令、工具 Schema、任务、记忆、历史和工具返回都要计入输入预算，还要留出生成空间。目前代码已能做上面的证据整理，请求前 Token 估算、输入硬限额和按窗口压力触发压缩待实现。
+每轮发送前按消息和当轮开放的工具 Schema 估算输入，超过 131,072 时触发压缩。DeepSeek 官方为 `deepseek-flash` 列出的总窗口为 1,048,576 Token。生成上限采用服务端默认，也支持显式覆盖。 [DeepSeek 模型容量](https://api-docs.deepseek.com/api/list-models/)
 
-- **Claude Code** 在接近窗口上限时摘要历史，支持指定摘要应保留的重点。如果一次工具输出导致压缩后窗口反复填满，会停止自动压缩循环。 [Claude Code 的上下文机制](https://code.claude.com/docs/en/how-claude-code-works#when-context-fills-up) · [反复压缩的处理](https://code.claude.com/docs/en/troubleshooting#auto-compaction-stops-with-a-thrashing-error)
-- **Codex** 分别管理窗口硬上限和自动压缩触发阈值。超过阈值后，可以通过 `/responses/compact` 得到更短的上下文供后续请求使用。 [公开窗口计量实现](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/context_window.rs) · [Codex Agent Loop](https://openai.com/index/unrolling-the-codex-agent-loop/)
-- **DeepSeek Harness** 用模型窗口、生成预留和额外余量计算触发线。触发后可以先裁减大工具结果，空间够就跳过模型摘要；需要摘要时，保留近期成对的工具请求和回复，摘要较早的交互。其近期保留比例用于限定保留多少原始历史，整个请求还包含系统指令、工具定义和摘要。 [DeepSeek Harness 压缩设计](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/compaction/compaction-basic/README.md#tuning-when-condensation-starts)
+超出估算输入上限时，先控制旧历史的大小，再省去当前工具批次的助手草稿，将有原文证据的大工具结果替换为短记录。核心任务、工作记忆中的支持与反对引用，以及最近工具调用和结果的配对都保留。每一级复核，并参考刚收到的批次大小争取给后续查询留出空间。超限时可以专门提交报告；连报告请求也放不下时，程序用已有证据收尾。 [窗口裁剪与快照](RobotOps_上下文管理.md#6-m5-请求前的窗口裁剪)
 
-RobotOps 的待验证方案是先计量、再整理、最后按需摘要。
-
-1. **请求前算空间。** 按当前模型和服务端的限制算输入上限，给生成留预算。触发线还要能容纳一批有上限的工具输出和估算误差。日志和原文查询优先限制范围、条数和返回大小。
-2. **有窗口压力就先做低成本整理。** 用重复聚合、原文引用和已有工作记忆，再估算一次。需要摘要时才处理较早且已完成的交互。保留任务、关键数值、支持证据和反证的引用、最近一批成对的工具请求与回复，原文件仍可回查。
-3. **复核下一次触发前还能查几轮。** 用同一计量方式重算压缩后的占用。`触发线 − 压缩后占用` 才是再次触发前能新增的数据量。按回放里实际的工具结果增长量检验这段空间，至少能接住下一批受控结果及估算余量。若一条超大结果让空间很快见底，缩小查询或回取范围。遇到窗口超限，输入确实变小后才有限重试，空间仍不足时带着已有证据和待查项收尾。
-
-触发阈值、最近历史保留量和摘要上限由回放调参。短调查应直接完成，多轮调查要记录压缩次数和两次压缩之间做了几轮有效取证。另用单条大输出和大量独特证据测试预算与收尾。每次都记录压缩前后 Token、腾出的空间、耗时和关键证据保留情况。 [上下文管理](RobotOps_上下文管理.md#5-当前实测和窗口边界)
+Claude Code 会在接近窗口上限时自动压缩。Codex 的公开配置将自动压缩阈值和模型窗口分别提供给用户。RobotOps 当前采用单次调查中的规则裁剪，压缩量由回归数据测量。 [Claude Code 上下文机制](https://code.claude.com/docs/en/how-claude-code-works#when-context-fills-up) · [Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)
 
 ## 4. 两个数据库在哪里，各存了什么
 
@@ -302,7 +294,7 @@ ROS 触发事实通过证据 ID 回读 `ros_fact_tasks.fact`，新的触发证�
 | **Python `runtime.db`** | `applications`、`incidents`、`ros_fact_tasks`、`runs` | 应用契约；异常症状、来源和状态；触发事实 JSON、副本对应的来源和序号、已关联的调查；每次调查的模型、状态、起止时间、报告正文或错误。 |
 | **Python `runtime.db`** | `evidence`、`memories`、`context_snapshots`、`context_inputs`、`context_messages` | 证据的运行和事件归属、工具来源、时间、SHA-256；工作记忆每个版本的正文；每轮请求的消息与工作记忆引用、装配清单、工具与系统指令引用、序号和哈希，可重组为完整 JSON。 |
 | **Python `runtime.db`** | `cases`、`cases_fts` | 历史案例正文、应用与版本，以及全文检索索引。 |
-| **Python `runtime.db`** | `managed_services`、`service_exits`、`recovery_actions`、`executions`、`execution_exits`、`launch_restarts` | 已登记的 systemd 单元和观测、服务退出读数、旧版动作及依据、程序启动和结束记录、故障出口日志位置、重启前后执行关联与验收状态。 |
+| **Python `runtime.db`** | `managed_services`、`service_exits`、`recovery_actions`、`executions`、`execution_exits`、`launch_restarts` | 已登记的 systemd 单元和观测、服务退出读数、旧版动作及依据、程序启动和结束记录、故障出口日志位置、重启前后执行关联、进程验收状态与一份 Topic 验收摘要。 |
 
 Python 数据目录还保存三个目录下的文件。数据库用 ID 串起这些记录，查看一份完整报告时可以顺着 ID 找到原文。
 
@@ -320,7 +312,7 @@ RobotOps 根据观测类型分流。下面用相机举例。
 
 - **单个普通节点退出。** 已配置 `respawn="true"` 的节点由原 `roslaunch` 拉起。RobotOps 保留它的退出码和故障前的控制台输出。
 - **整条 launch 异常结束。** 用户运行 `robotops run --restart-on-exit camera -- roslaunch camera_driver camera.launch` 时，Runner 获准按原参数重启一次。触发条件是 launch 非零退出，或本机必需节点非零退出并导致这次 launch 结束。启动范围由这个 launch 文件定义。
-- **进程还在，Topic 停发。** C++ 把观测推给 Python，Worker 自动建任务并让 Agent 调查。有了确切故障依据以后，再决定处置目标。业务验收要看到原 Topic 在观察期内持续有新消息。
+- **进程还在，Topic 停发。** C++ 把观测推给 Python，Worker 自动建任务并让 Agent 调查。有了确切故障依据以后，再决定处置目标。
 
 一次重启的记录可以从 `GET /incidents/{id}` 直接读到。`execution_exit.execution_id` 指向故障前的旧启动和日志，`launch_restart.execution_id` 指向新的启动。Runner 等 ROS 报告启动完成，再观察 5 秒。通过记为 `STABLE`，提前退出记为 `FAILED`，验收中操作员停止记为 `INTERRUPTED`。`STABLE` 只说明新 launch 通过了进程级验收，原故障继续保留供调查。
 
@@ -343,13 +335,43 @@ Noetic 联调中，测试节点第一次退出码为 17，第二次启动达到�
 
 systemd 适合开机启动 RobotOps 自己、长期运行的非 ROS 服务，或需要无人值守的整套 bringup。独立的 systemd 服务监测负责记录服务退出事件。 [ROS 1 重启入口与查询](../README.md#为一个独立的-ros-1-launch-启用一次重启)
 
+### M4 重启后的 Topic 业务验收
+
+启动命令用 `--verify-topic /camera/image_raw` 标明应恢复的原输出。下面的验收由 Runner 与 C++ 采集器完成，过程中无需调用模型。
+
+```mermaid
+flowchart LR
+    A["原 launch 异常退出"] --> B["Runner 按原参数重启一次"]
+    B --> C["启动通过 5 秒进程验收"]
+    C --> D["C++ 在同一 ROS Master 订阅原 Topic"]
+    D --> E["观察同一发布节点的连续新消息"]
+    E --> F[("runtime.db<br/>原事件的重启回执")]
+```
+
+C++ 只统计实际收到的消息。观察窗口从第一条有效新消息开始，间隔超过上限或发布节点变化时重新计时。首条锁存回放会被跳过。间隔上限取应用契约的 `health.max_output_silence_seconds`，默认 1 秒。默认连续窗口为 5 秒，含等待的验收超时为 10 秒。验收前提前退出、观察超时和主动停止都会留下各自的结果。回执保留发布节点名，便于核对原 Topic 的消息来源。
+
+API 仍从原故障查 `launch_restart`。外层 `state` 是进程验收，`topic_acceptance.state` 是业务信号验收。SQLite 通过既有重启行关联原事件和新进程，额外记录目标 Topic、阈值、发布节点、有效消息数、连续窗口的时长、间隔和时间戳，每次重启只保留一份摘要。消息载荷留在 ROS 传输链路。 [启动命令](../README.md#验收重启后的原-topic)
+
+2026-11-25 10:01（北京时间），在隔离的 ROS 1 Noetic 环境用真实发布节点验证 `/m4/output`，要求消息间隔最多 400 ms、连续输出至少 5 秒。
+
+| 第二次启动后的现场 | 进程状态 | Topic 结果 |
+|---|---|---|
+| 连续发布 | `STABLE` | `PASSED`。5,016 ms 内收到 200 条消息，成功窗口内最大间隔 25 ms。 |
+| 间歇发布 | `STABLE` | `FAILED`。共收到 80 条，超时时最近连续窗口只有 176 ms。 |
+| 只有一条锁存回放，或持续发布在另一个 Topic | `STABLE` | `FAILED`。原 Topic 的有效新消息数为 0。 |
+| 观察中由操作员停止 | `STABLE` | `INTERRUPTED`。 |
+| 必需节点重启后再次异常退出 | `FAILED` | `FAILED`。原因是新 launch 未达到进程稳定期。 |
+
+包含上述场景在内，全量回归 110 项通过。结果摘要和连续发布、间歇发布两轮的 `runtime.db` 样本保存在本机 `data/ros1-m4-20261125/`。 [Noetic 联调用例](../tests/test_ros_facts.py)
+
 ## 6. 项目进度和验证
 
 | 能力 | 当前实际进度 |
 |---|---|
 | **M1 只读调查、M2 应用接入与退出监测** | 支持有证据引用的报告，支持普通程序、ROS 1 launch 和已登记 systemd 服务的异常退出接入。退出事件可从 API 发起调查。 |
 | **M3a 自动调查** | C++ 写入 Noetic Topic 静默事实后主动推送，Python 自动建事件和派发调查。触发事实正文在 Python 任务表内保存一次，报告按证据 ID 回查。 |
-| **M3b 受控恢复** | ROS 1 Runner 支持显式允许的一次 launch 重启，并记录新实例的进程级验收。systemd 的旧动作仅用于历史回查。M4 将用原 Topic 验收业务信号恢复。 |
-| **M5 窗口管理** | 基础证据整理、工作记忆、原文回取和快照可用，模型窗口预算和阈值压缩待实现。ROS 2 与实体设备感知也属于后续接入。 |
+| **M3b 受控恢复** | ROS 1 Runner 支持显式允许的一次 launch 重启，并记录新实例的进程级验收。systemd 的旧动作仅用于历史回查。 |
+| **M4 业务验收** | 支持在 ROS 1 launch 重启后检查指定 Topic 的持续新消息，结果与观测摘要可随原事件回查。 |
+| **M5 窗口管理** | 已接入输入预算、输出预留、分层裁剪、裁剪后复核和超限收尾。申请窗口和实报 Token 的差异可从快照和用量记录对照。 |
 
-本地回归覆盖真实 Noetic 的 Unix Socket 自动调查、一次重启成功和重启后仍失败。真实 ROS 观测用于验证感知、派发、报告协议和落盘链路。已有 DeepSeek UDP 对照用于验证处理停滞的工具选取和证据链。0.4.0 的 ROS 1 自动端到端结果见文首。默认短单 Agent 调查现在关闭记忆写入，完整日志只复用已经查过的时段。现行规则通过同场景离线回放，包含真实 Noetic 的全量回归共 102 项通过。 [评测入口](../README.md#测试与实验) · [上下文管理](RobotOps_上下文管理.md)
+本地回归覆盖真实 Noetic 的 Unix Socket 自动调查、一次重启成功和重启后仍失败。真实 ROS 观测用于验证感知、派发、报告协议和落盘链路。已有 DeepSeek UDP 对照用于验证处理停滞的工具选取和证据链。0.4.0 的 ROS 1 自动端到端结果见文首。默认短单 Agent 调查关闭记忆写入，完整日志复用已经查过的时段。 [评测入口](../README.md#测试与实验) · [上下文管理](RobotOps_上下文管理.md)

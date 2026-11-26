@@ -10,6 +10,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 # 限定 1–64 位 ASCII 标识：首位小写字母，后续仅字母/数字/下划线/短横线。
 # 首尾锚点禁止把路径片段混成应用/组件名；标识校验不能替代运行归属和动作授权。
 Identifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+RosTopic = Annotated[str, Field(pattern=r"^/[A-Za-z0-9_/]+$", max_length=256)]
 # 一个确定的服务单元，可含模板实例和 systemd 的十六进制转义。禁止路径、通配符和选项。
 ServiceUnit = Annotated[
     str, Field(

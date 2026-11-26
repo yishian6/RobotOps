@@ -43,13 +43,16 @@ def main():
     facts.add_argument("--once", action="store_true", help="Investigate one pending or new fact and exit")
     facts.add_argument("--max-model-calls", type=int, default=6, help="Maximum calls per automatic run")
     run = commands.add_parser(
-        "run", usage="robotops run [--restart-on-exit] APP_ID -- COMMAND [ARG ...]",
+        "run", usage="robotops run [--restart-on-exit [--verify-topic /TOPIC "
+        "[--ros-facts-bin PATH]]] APP_ID -- COMMAND [ARG ...]",
         help="Register and run an application in the foreground",
     )
     run.add_argument(
         "--restart-on-exit", action="store_true",
         help="Restart an unexpectedly exited ROS 1 launch once",
     )
+    run.add_argument("--verify-topic", help="Verify fresh messages on this ROS 1 output after restart")
+    run.add_argument("--ros-facts-bin", type=Path, help="Path to the ROS 1 collector for Topic verification")
     run.add_argument("app_id")
     run.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -104,7 +107,8 @@ def main():
         try:
             return run_application(
                 Store(Config.load().data_dir), args.app_id, args.argv,
-                restart_on_exit=args.restart_on_exit,
+                restart_on_exit=args.restart_on_exit, verify_topic=args.verify_topic,
+                ros_facts_bin=args.ros_facts_bin,
             )
         except ValueError as exc:
             run.error(str(exc))

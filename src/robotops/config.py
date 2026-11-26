@@ -9,6 +9,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+DEFAULT_COMPACT_AFTER_TOKENS = 128 * 1024
+_DEEPSEEK_WINDOW_MODELS = {"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"}
+_DEEPSEEK_CONTEXT_WINDOW_TOKENS = 1024 * 1024
+_DEEPSEEK_NON_THINKING_OUTPUT_TOKENS = 8 * 1024
+
+
+@dataclass(frozen=True)
+class ContextWindow:
+    compact_after_tokens: int = DEFAULT_COMPACT_AFTER_TOKENS
+    total_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def __post_init__(self):
+        if type(self.compact_after_tokens) is not int or self.compact_after_tokens < 1:
+            raise ValueError("Context compaction threshold must be a positive integer")
+        for name, value in (("Model context window", self.total_tokens), ("Model output limit", self.output_tokens)):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
+        if self.total_tokens is not None and (self.output_tokens or 0) >= self.total_tokens:
+            raise ValueError("Model context window must be larger than its output limit")
+
+    @property
+    def input_limit_tokens(self) -> int:
+        if self.total_tokens is None:
+            return self.compact_after_tokens
+        return self.total_tokens - (self.output_tokens or 0)
+
 
 @dataclass(frozen=True)
 class Config:
@@ -36,6 +63,10 @@ class Config:
     # 版本固定指令身份；上下文策略只改变历史呈现方式，不改变证据原文与调查权限。
     prompt_version: str = "v2"
     context_strategy: str = "evidence"
+    context_compact_after_tokens: int = DEFAULT_COMPACT_AFTER_TOKENS
+    context_window_tokens: int | None = None
+    model_output_tokens: int | None = None
+    context_window: ContextWindow = field(init=False)
 
     def __post_init__(self):
         """
@@ -85,6 +116,21 @@ class Config:
             raise ValueError("Branch timeout must be finite and positive")
         if type(self.monitor_interval_seconds) not in (int, float) or not 0 < self.monitor_interval_seconds < float("inf"):
             raise ValueError("Monitor interval must be finite and positive")
+        official_deepseek = (
+            parsed.scheme == "https" and parsed.hostname == "api.deepseek.com"
+            and parsed.port in (None, 443) and self.model in _DEEPSEEK_WINDOW_MODELS
+        )
+        total, output = self.context_window_tokens, self.model_output_tokens
+        if official_deepseek:
+            # Use provider defaults for the hard-window calculation only.
+            if total is None:
+                total = _DEEPSEEK_CONTEXT_WINDOW_TOKENS
+            if output is None:
+                output = _DEEPSEEK_NON_THINKING_OUTPUT_TOKENS
+        object.__setattr__(self, "context_window", ContextWindow(
+            compact_after_tokens=self.context_compact_after_tokens,
+            total_tokens=total, output_tokens=output,
+        ))
 
     @classmethod
     def load(cls):
@@ -120,6 +166,9 @@ class Config:
                 "prompts_dir",
                 "prompt_version",
                 "context_strategy",
+                "context_compact_after_tokens",
+                "context_window_tokens",
+                "model_output_tokens",
             }
             # 配置键拼错必须启动失败，否则看似设置成功却仍使用默认值，故障调查将无法复现。
             if set(values) - allowed:
@@ -143,6 +192,9 @@ class Config:
             "ROBOTOPS_PROMPTS_DIR": ("prompts_dir", Path),
             "ROBOTOPS_PROMPT_VERSION": ("prompt_version", str),
             "ROBOTOPS_CONTEXT_STRATEGY": ("context_strategy", str),
+            "ROBOTOPS_CONTEXT_COMPACT_AFTER_TOKENS": ("context_compact_after_tokens", int),
+            "ROBOTOPS_CONTEXT_WINDOW_TOKENS": ("context_window_tokens", int),
+            "ROBOTOPS_MODEL_OUTPUT_TOKENS": ("model_output_tokens", int),
         }
         for variable, (name, convert) in overrides.items():
             if variable in os.environ:

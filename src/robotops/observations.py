@@ -67,6 +67,37 @@ def compact_model_observation(tool: str, result: dict) -> dict:
     return {**result, "data": {**data, "current": view} if metrics else view, "view": "selected_fields"}
 
 
+def window_diagnostic_fields(tool: str | None, data: dict) -> dict:
+    """Keep the structured fields used to distinguish live-process and throughput failures."""
+    if tool not in {"inspect_process", "query_metrics"}:
+        return {}
+    metrics = tool == "query_metrics"
+    snapshot = data.get("current") if metrics else data
+    view = {}
+    if metrics:
+        for key in ("rates", "output_age_seconds_wall_clock"):
+            if isinstance(data.get(key), dict):
+                view[key] = data[key]
+    components = snapshot.get("components") if isinstance(snapshot, dict) else None
+    if isinstance(components, dict):
+        sections = (
+            ("process", _PROCESS_ID_FIELDS),
+            ("telemetry", _METRIC_FIELDS if metrics else _INSTANCE_FIELDS),
+        )
+        selected = {}
+        for name, component in components.items():
+            if isinstance(component, dict):
+                selected[name] = {
+                    section: {key: value for key, value in component[section].items() if key in fields}
+                    for section, fields in sections if isinstance(component.get(section), dict)
+                }
+        if metrics:
+            view["current"] = {"components": selected}
+        else:
+            view["components"] = selected
+    return view
+
+
 class ObservationUnavailable(ValueError):
     """
         观测源未就绪或数据不可用，不等同于已确认设备故障。

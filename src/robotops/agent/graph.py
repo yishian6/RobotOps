@@ -12,10 +12,11 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
+from ..config import ContextWindow
 from ..observations import compact_model_observation
 from ..storage import Store
 from .client import AssistantMessage, DeepSeekClient, ModelError
-from .context import ContextSnapshots, Strategy, assemble
+from .context import ContextSnapshots, Strategy, assemble, fit_context_window
 from .recovery import MAX_STALLED_ROUNDS, OPTIONAL_TOOLS, InvestigationRecovery
 
 DEFAULT_MAX_MODEL_CALLS = 8
@@ -75,6 +76,7 @@ class InvestigationGraph:
     context_strategy: Strategy
     snapshots: ContextSnapshots
     budget: ModelCallBudget
+    context_window: ContextWindow = ContextWindow()
 
     def _request_message(
         self, outgoing: list[dict], tools: list[dict], tags: dict,
@@ -145,6 +147,22 @@ class InvestigationGraph:
                 }
             return recovery.fallback_report(reason)
 
+        def request_tools(reason):
+            if reason is None:
+                return tools
+            tool, = (tool for tool in tools if tool["function"]["name"] == final_tool)
+            function = tool["function"]
+            instruction = {
+                "model_call_budget": " 本轮是最后一次模型请求。",
+                "no_progress": " 连续查询未获得新线索，请结束调查。",
+                "context_window": " 上下文已达到工作窗口，请结束调查。",
+            }.get(reason, "")
+            return [{**tool, "function": {
+                **function,
+                "description": function["description"] + instruction + " 请根据已有证据"
+                "提交结果，明确标出缺少实测的结论和待查项。",
+            }}]
+
         def call_model(state: InvestigationState) -> InvestigationState:
             nonlocal closing, context_sequence
             _remaining_time(deadline)
@@ -165,24 +183,29 @@ class InvestigationGraph:
                 if not accepted:
                     return {"messages": history, "report": fallback_report("model_call_budget")}
                 memory = memory_snapshot()
-                outgoing, manifest = assemble(history, memory, self.context_strategy)
-                manifest.update(audit)
-                available = tools
+                base, manifest = assemble(history, memory, self.context_strategy)
+                assembled = manifest.copy()
+                available = request_tools(closing)
+                outgoing, window_audit = fit_context_window(
+                    history, base, available, memory, manifest, self.context_window,
+                )
+                if not window_audit["fits"] and closing is None:
+                    initial = window_audit["before_estimated_tokens"]
+                    closing = "context_window"
+                    available = request_tools(closing)
+                    manifest = assembled
+                    outgoing, window_audit = fit_context_window(
+                        history, base, available, memory, manifest, self.context_window,
+                    )
+                    window_audit["before_all_tools_estimated_tokens"] = initial
+                if not window_audit["fits"]:
+                    closing = "context_window"
+                    budget_event.update(report_only=closing, context_window=window_audit)
+                    return {"messages": history, "report": fallback_report(closing)}
+                manifest.update(audit, context_window=window_audit)
+                budget_event["report_only"] = closing
                 if closing is not None:
-                    tool, = (tool for tool in tools if tool["function"]["name"] == final_tool)
                     manifest["report_only"] = closing
-                    function = tool["function"]
-                    instruction = {
-                        "model_call_budget": " 本轮是最后一次模型请求。",
-                        "no_progress": " 连续查询未获得新线索，请结束调查。",
-                    }.get(closing, "")
-                    available = [{
-                        **tool, "function": {
-                            **function,
-                            "description": function["description"] + instruction + " 请根据已有证据"
-                            "提交结果，明确标出缺少实测的结论和待查项。",
-                        },
-                    }]
 
                 # 先保存实际发送视图，网络错误也能对应到输入。
                 context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})

@@ -5,7 +5,7 @@ from typing import Literal, get_args
 
 from pydantic import ValidationError
 
-from ..config import Config
+from ..config import Config, ContextWindow
 from ..models import DiagnosticReport
 from ..observations import ObservationSource
 from ..storage import Store
@@ -95,6 +95,7 @@ def investigate(
     branch_timeout_seconds: float = Config.branch_timeout_seconds,
     automatic: bool = False,
     max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
+    context_window: ContextWindow = ContextWindow(),
 ):
     """运行只读调查并返回持久化记录。
 
@@ -122,7 +123,7 @@ def investigate(
         graph = InvestigationGraph(
             store=store, run_id=run_id, complete=complete, model_name=model_name,
             context_strategy=context_strategy, snapshots=ContextSnapshots(store, run_id),
-            budget=ModelCallBudget(max_model_calls),
+            budget=ModelCallBudget(max_model_calls), context_window=context_window,
         )
         incident, evidence_id = _with_trigger_evidence(store, run_id, incident)
         initial_evidence = (evidence_id,) if evidence_id is not None else ()

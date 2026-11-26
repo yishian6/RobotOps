@@ -72,6 +72,7 @@ class Store:
             # memories 按版本保留注记，context_snapshots 按请求序号保存精确输入，二者用途不同。
             # one_active_investigation 仅约束 RUNNING，保留同一事件的多次历史调查。
             db.executescript("""
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS applications (
                     app_id TEXT PRIMARY KEY, contract TEXT NOT NULL
                 );
@@ -151,7 +152,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS launch_restarts (
                     incident_id TEXT PRIMARY KEY REFERENCES execution_exits,
                     execution_id TEXT NOT NULL UNIQUE REFERENCES executions,
-                    state TEXT NOT NULL, checked_at TEXT
+                    state TEXT NOT NULL, checked_at TEXT, topic_acceptance TEXT
                 );
                 CREATE TABLE IF NOT EXISTS ros_fact_tasks (
                     source_id TEXT NOT NULL, sequence INTEGER NOT NULL,
@@ -160,6 +161,8 @@ class Store:
                     PRIMARY KEY (source_id, sequence)
                 );
             """)
+            if not any(col["name"] == "topic_acceptance" for col in db.execute("PRAGMA table_info(launch_restarts)")):
+                db.execute("ALTER TABLE launch_restarts ADD COLUMN topic_acceptance TEXT")
 
     @contextmanager
     def connection(self):
@@ -448,6 +451,7 @@ class Store:
 
     def start_execution(
         self, app_id: str, execution_id: str, *, restart_of: str | None = None,
+        topic_acceptance: dict | None = None,
     ) -> None:
         """
             首次启动时自动登记最小契约，并保存独立运行标识。
@@ -456,6 +460,7 @@ class Store:
                 app_id: 操作员指定的应用名。
                 execution_id: 关联本次终端输出的唯一编号。
                 restart_of: 本次执行要恢复的事件编号，普通启动时为空。
+                topic_acceptance: 本次重启的可选 Topic 验收目标与阈值。
 
             Returns:
                 None: 登记和运行记录已一起提交。
@@ -473,8 +478,9 @@ class Store:
             )
             if restart_of is not None:
                 db.execute(
-                    "INSERT INTO launch_restarts VALUES (?, ?, 'STARTING', NULL)",
-                    (restart_of, execution_id),
+                    "INSERT INTO launch_restarts (incident_id, execution_id, state, topic_acceptance) "
+                    "VALUES (?, ?, 'STARTING', ?)",
+                    (restart_of, execution_id, json.dumps(topic_acceptance) if topic_acceptance else None),
                 )
 
     def finish_launch_restart(self, execution_id: str, state: str) -> None:
@@ -484,6 +490,15 @@ class Store:
                 "UPDATE launch_restarts SET state=?, checked_at=? "
                 "WHERE execution_id=? AND state='STARTING'",
                 (state, utc_now(), execution_id),
+            )
+
+    def finish_topic_acceptance(self, execution_id: str, result: dict) -> None:
+        """Keep one final observation on the existing restart receipt."""
+        with self.connection() as db:
+            db.execute(
+                "UPDATE launch_restarts SET topic_acceptance=? WHERE execution_id=? "
+                "AND json_extract(topic_acceptance, '$.state')='PENDING'",
+                (json.dumps({**result, "checked_at": utc_now()}, allow_nan=False), execution_id),
             )
 
     def finish_execution(self, execution_id: str, returncode: int) -> None:
@@ -619,7 +634,8 @@ class Store:
             launch_restart = None
             if execution_exit is not None:
                 launch_restart = db.execute(
-                    "SELECT execution_id, state, checked_at FROM launch_restarts WHERE incident_id=?",
+                    "SELECT execution_id, state, checked_at, topic_acceptance "
+                    "FROM launch_restarts WHERE incident_id=?",
                     (incident_id,),
                 ).fetchone()
             fact_task = db.execute(
@@ -639,7 +655,11 @@ class Store:
         if execution_exit is not None:
             result["execution_exit"] = dict(execution_exit)
         if launch_restart is not None:
-            result["launch_restart"] = dict(launch_restart)
+            restart = dict(launch_restart)
+            acceptance = restart.pop("topic_acceptance")
+            if acceptance is not None:
+                restart["topic_acceptance"] = json.loads(acceptance)
+            result["launch_restart"] = restart
         if fact_task is not None:
             result["ros_fact"] = json.loads(fact_task["fact"])
             result["automatic_run_id"] = fact_task["run_id"]
