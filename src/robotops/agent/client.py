@@ -9,7 +9,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
-from openai import DefaultAsyncHttpxClient, DefaultHttpxClient
+from openai import BadRequestError, DefaultAsyncHttpxClient, DefaultHttpxClient
 
 from ..config import Config
 from ..models import Model
@@ -58,6 +58,19 @@ class ModelError(RuntimeError):
         super().__init__(message)
         # 异常可由 API 返回，不能把响应原文或供应商内部字段挂在公开对象上。
         self.usage = _reported_usage(usage)
+
+
+class ContextLengthError(ModelError):
+    """The provider explicitly rejected the input due to context length."""
+
+
+def _context_length_rejected(error: Exception) -> bool:
+    if not isinstance(error, BadRequestError):
+        return False
+    if error.code in ("context_length_exceeded", "context_window_exceeded"):
+        return True
+    message = error.message.lower()
+    return "maximum context length" in message and ("tokens" in message or "exceed" in message)
 
 
 class FunctionCall(Model):
@@ -256,6 +269,8 @@ class DeepSeekClient:
             raise
         except Exception as exc:
             # SDK/框架异常可能携带响应正文、代理 URL 或请求头，只保留通用错误类别与有效计数。
+            if _context_length_rejected(exc):
+                raise ContextLengthError("Model input exceeded the provider context window", recorder.usage) from exc
             raise ModelError(
                 "Model request failed or returned an invalid response", recorder.usage
             ) from exc

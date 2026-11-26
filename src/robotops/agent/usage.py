@@ -59,10 +59,12 @@ def summarize_usage(events: list[dict], snapshots: list[dict]) -> dict:
     roles = {item["sequence"]: item.get("agent_role") or "unknown" for item in snapshots}
     recorded = defaultdict(list)
     matched = set()
+    by_sequence = {}
     for event in model_events:
         sequence = event.get("context_sequence")
         if sequence in roles:
             matched.add(sequence)
+            by_sequence[sequence] = event
         role = event.get("agent_role") or roles.get(sequence, "unknown")
         recorded[role].append(event)
     # 并行分支可能已有一轮请求但尚无响应，按序号匹配才能把缺失归到正确的角色。
@@ -87,9 +89,43 @@ def summarize_usage(events: list[dict], snapshots: list[dict]) -> dict:
             "denied_claims": sum(not event["accepted"] for event in reservations),
             "report_only": main_latest.get("report_only"),
         }
+    window_rows = []
+    stages = Counter()
+    for item in snapshots:
+        window = item.get("context_window")
+        if not window:
+            continue
+        applied = window.get("stages")
+        if applied is None:
+            applied = [] if window["stage"] == "unchanged" else [window["stage"]]
+        stages.update(applied)
+        event = by_sequence.get(item["sequence"], {})
+        usage = event.get("usage") or {}
+        actual = usage.get("prompt_tokens")
+        if type(actual) is not int or actual < 0:
+            actual = None
+        estimated = window["after_estimated_tokens"]
+        # Legacy manifests counted bytes under a token label. Keep them available for audit.
+        legacy = window["estimator"] == "utf8_request_bytes_with_framing"
+        window_rows.append({
+            "context_sequence": item["sequence"], "estimator": window["estimator"],
+            "stages": applied, "provider_retry": window.get("provider_retry", False),
+            "before_estimated_tokens": None if legacy else window["before_estimated_tokens"],
+            "after_estimated_tokens": None if legacy else estimated,
+            "actual_prompt_tokens": actual,
+            "estimate_error_tokens": estimated - actual if not legacy and actual is not None else None,
+            **{key: usage.get(key) for key in CACHE_FIELDS},
+        })
     return {
         **_totals(model_events, len(snapshots), sum(pending.values())),
         "includes_summary_calls": "summary" in by_role,
         "by_role": by_role,
         "model_budget": budget,
+        "context_window": {
+            "compacted_requests": sum(bool(row["stages"]) for row in window_rows),
+            "stages": dict(stages),
+            "provider_rejections": sum(event.get("error_kind") == "context_length" for event in model_events),
+            "provider_retries": sum(row["provider_retry"] for row in window_rows),
+            "requests": window_rows,
+        },
     }

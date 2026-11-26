@@ -19,6 +19,10 @@ _METRIC_FIELDS = _INSTANCE_FIELDS | {
 } | set(_METRIC_ALIASES.values())
 
 
+def log_rows_key(data: dict) -> str | None:
+    return next((key for key in ("rows", "lines", "logs") if isinstance(data.get(key), list)), None)
+
+
 def compact_model_observation(tool: str, result: dict) -> dict:
     """
         为主 Agent 投影常规进程和指标结果。保留时间、实例和诊断字段，完整观测仍按引用可读。

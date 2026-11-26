@@ -15,12 +15,59 @@ from robotops.agent.client import DeepSeekClient, ModelError
 from robotops.agent.context import ContextSnapshots
 from robotops.agent.prompt_loader import load_investigation_prompt
 from robotops.agent.recovery import InvestigationRecovery
-from robotops.agent.workflow import investigate
+from robotops.agent.workflow import _validate_report, investigate
 from robotops.api import create_app
 from robotops.config import Config
 from robotops.models import ApplicationContract, DiagnosticReport, IncidentCreate
 from robotops.storage import ConflictError, Store
 from robotops.tools import ToolGateway, tool_definitions
+
+
+def test_report_rejects_first_sample_stall_when_cited_observations_show_prior_completion(runtime):
+    store, _, incident = runtime
+    run_id = store.start_run(incident["id"], "fixture")
+    evidence_id = store.save_evidence(run_id, "query_metrics", {
+        "status": "ok",
+        "data": {"current": {"components": {"processor": {"telemetry": {
+            "instance_id": "processor-old", "processed_count": 4,
+            "last_output_at": "2026-11-25T05:45:35.658744Z",
+            "processing_started_at": "2026-11-25T05:45:35.709744Z",
+        }}}}},
+    })
+    report = {
+        "status": "proposed", "summary": "首个输入即卡住。",
+        "hypotheses": [{
+            "cause": "一个在途样本长期未完成",
+            "assessment": "supported", "evidence_ids": [evidence_id],
+        }],
+        "recommended_action": {
+            "kind": "collect_more_evidence", "target": "processor",
+            "reason": "获取阻塞位置", "evidence_ids": [evidence_id],
+        },
+    }
+    options = {
+        "store": store, "run_id": run_id, "components": ["producer", "processor"],
+        "visible_evidence": None, "required_evidence_id": None,
+    }
+    with pytest.raises(ModelError, match="已完成 4 个样本"):
+        _validate_report(json.dumps(report, ensure_ascii=False), **options)
+    report["summary"] = "采样时有一个在途样本未完成。此前已完成 4 个样本。"
+    assert _validate_report(json.dumps(report, ensure_ascii=False), **options)["status"] == "proposed"
+    report["summary"] = "证据不能断言首个输入即卡住。"
+    assert _validate_report(json.dumps(report, ensure_ascii=False), **options)["status"] == "proposed"
+    report["summary"] = "producer 首个输入即卡住。"
+    assert _validate_report(json.dumps(report, ensure_ascii=False), **options)["status"] == "proposed"
+    report["summary"] = "processor 首个输入即卡住。"
+    report["recommended_action"]["target"] = "producer"
+    with pytest.raises(ModelError, match="processor 已完成 4 个样本"):
+        _validate_report(json.dumps(report, ensure_ascii=False), **options)
+    newer_id = store.save_evidence(run_id, "inspect_process", {
+        "status": "ok",
+        "data": {"components": {"processor": {"telemetry": {"instance_id": "processor-new"}}}},
+    })
+    report["hypotheses"][0]["evidence_ids"].append(newer_id)
+    report["summary"] = "processor 的实例 processor-new 首个输入即卡住。"
+    assert _validate_report(json.dumps(report, ensure_ascii=False), **options)["status"] == "proposed"
 
 
 @pytest.fixture
@@ -166,6 +213,14 @@ def test_progress_uses_observation_content_across_reads_and_dispatches():
     assert not recovery.record_progress("dispatch_investigation", {
         "status": "ok", "findings": [{"support_ids": ["ev-2"]}],
     })
+    supervisor = InvestigationRecovery(evidence.__getitem__)
+    assert supervisor.record_progress("dispatch_investigation", {
+        "status": "ok", "findings": [{"support_ids": ["ev-1"]}],
+    })
+    assert not supervisor.record_progress("dispatch_investigation", {
+        "status": "ok", "findings": [{"support_ids": ["ev-2"]}],
+    })
+    assert supervisor.record_progress("read_evidence", {"status": "ok", **evidence["ev-1"]})
     assert recovery.record_progress("search_logs", {
         "status": "ok", "data": {**log, "rows": [{**second_log, "at": "t3"}]},
     })

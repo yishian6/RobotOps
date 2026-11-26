@@ -2,14 +2,21 @@
     只读诊断工具：服务端绑定事件范围，校验参数，并为实际观测保存原始证据。
 """
 
+import json
 from collections.abc import Collection
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import AwareDatetime, Field, ValidationError
 
 from .agent.memory import EvidenceID, MemoryStore, WorkingMemory
 from .models import ApplicationContract, Identifier, Model, utc_now
-from .observations import ObservationSource, ObservationUnavailable
+from .observations import (
+    ObservationSource,
+    ObservationUnavailable,
+    log_rows_key,
+    window_diagnostic_fields,
+)
 from .retrieval import CaseLibrary
 from .storage import Store
 
@@ -38,12 +45,142 @@ class LogArgs(Model):
     since: AwareDatetime | None = None
 
 
+_LOG_PAGE_LIMIT = 20
+
+
 class EvidenceArgs(Model):
-    """
-        原文回取只接受平台生成的证据 ID，实际所属运行仍由 Store 校验。
-    """
+    """在原证据内读取日志分页，或选择观测数据的顶层字段。"""
 
     evidence_id: EvidenceID
+    offset: int = Field(default=0, ge=0, description="日志页起点，从 0 开始。续读使用 next_offset。")
+    limit: int = Field(default=_LOG_PAGE_LIMIT, ge=1, le=50, description="每页最多返回的日志条数。")
+    fields: list[Annotated[str, Field(min_length=1, max_length=96)]] = Field(
+        default_factory=list, max_length=20,
+        description="可选。只选择 JSON 日志行或非日志 data 的顶层字段；日志身份和时间自动保留。",
+    )
+
+
+# 单条超长记录也不能把整页撑到失控。被省略的字段仍保存在原证据中。
+_EVIDENCE_VIEW_BYTES = 16 * 1024
+_LOG_IDENTITY = {"at", "timestamp", "component", "instance_id", "source", "level"}
+_LOG_METADATA = {
+    "runtime_id", "source", "process_name", "truncated", "malformed_lines",
+    "incomplete_tail", "available", "stream", "captured_at",
+}
+
+
+def _evidence_size(value) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+class EvidenceView(dict):
+    """Model payload with the corresponding observation available to the local progress check."""
+
+    def __init__(self, payload: dict, observation: dict):
+        super().__init__(payload)
+        # Attributes are never serialized into model messages or the trace.
+        self.observation = observation
+
+
+def _log_view(payload: dict, entry: dict, key: str, visible: dict, page: dict) -> EvidenceView:
+    raw = entry["raw"]
+    source = raw["data"]
+    omitted = set(page["omitted_rows"])
+    # Sign the source rows actually shown, so narrower field selections cannot invent progress.
+    rows = [
+        source[key][index] for index, row in enumerate(visible[key], page["offset"])
+        if index not in omitted and row is not None and row != {}
+    ]
+    return EvidenceView(payload, {**entry, "raw": {**raw, "data": {**source, key: rows}}})
+
+
+def _evidence_view(entry: dict, args: EvidenceArgs) -> dict:
+    """只改变模型看到的正文，保留原证据元数据和哈希。"""
+    raw = entry["raw"]
+    data = raw.get("data")
+    if not isinstance(data, dict):
+        return entry
+    log_key = log_rows_key(data) if entry["tool"] == "search_logs" else None
+    if log_key is not None:
+        selected, page = _log_page(data, log_key, offset=args.offset, limit=args.limit, fields=args.fields)
+        payload = {
+            **entry, "view": "evidence_page", "raw": {**raw, "data": selected}, "page": page,
+        }
+        return _log_view(payload, entry, log_key, selected, page)
+    if args.fields:
+        selected = {key: data[key] for key in args.fields if key in data}
+    elif _evidence_size(raw) <= _EVIDENCE_VIEW_BYTES:
+        return entry
+    else:
+        selected = window_diagnostic_fields(entry["tool"], data)
+    fields = {}
+    remaining = _EVIDENCE_VIEW_BYTES
+    for key, value in selected.items():
+        size = _evidence_size({key: value})
+        if size <= remaining:
+            fields[key] = value
+            remaining -= size
+    return EvidenceView({
+        **entry, "view": "evidence_fields",
+        "available_fields": [key for key in data if len(key) <= 96][:50],
+        "raw": {**raw, "data": fields},
+    }, entry)
+
+
+def _log_page(
+    data: dict, log_key: str, *, offset: int | None = None,
+    limit: int = _LOG_PAGE_LIMIT, fields: Collection[str] = (),
+) -> tuple[dict, dict]:
+    """Build a contiguous page from an offset, or the latest page for a new search."""
+    rows = data[log_key]
+    include = set(fields) | _LOG_IDENTITY
+    metadata = {
+        key: value for key, value in data.items()
+        if key in _LOG_METADATA and _evidence_size({key: value}) <= 256
+    }
+    # Preserve short adapter diagnostics outside the rows without growing the page without bound.
+    metadata_left = max(0, 1024 - _evidence_size(metadata))
+    for key, value in data.items():
+        if key == log_key or key in metadata or isinstance(value, (dict, list)):
+            continue
+        size = _evidence_size({key: value})
+        if size <= min(96, metadata_left):
+            metadata[key] = value
+            metadata_left -= size
+    page, omitted_rows = [], []
+    remaining = _EVIDENCE_VIEW_BYTES - _evidence_size({**metadata, log_key: []})
+    if offset is None:
+        indices = range(len(rows) - 1, max(-1, len(rows) - limit - 1), -1)
+    else:
+        offset = min(offset, len(rows))
+        indices = range(offset, min(len(rows), offset + limit))
+    for index in indices:
+        original = rows[index]
+        row = (
+            {key: value for key, value in original.items() if key in include}
+            if fields and isinstance(original, dict) else original
+        )
+        size = _evidence_size(row) + 1
+        if size > remaining:
+            if page:
+                break
+            # Preserve the row position and identity; the caller may request a smaller set of fields.
+            omitted_rows.append(index)
+            row = {key: value for key, value in row.items() if key in _LOG_IDENTITY} if isinstance(row, dict) else None
+            if _evidence_size(row) + 1 > remaining:
+                row = None
+            size = _evidence_size(row) + 1
+        page.append(row)
+        remaining -= size
+    if offset is None:
+        page.reverse()
+        offset = len(rows) - len(page)
+    end = offset + len(page)
+    return {**metadata, log_key: page}, {
+        "offset": offset, "total": len(rows), "returned": len(page),
+        "next_offset": end if end < len(rows) else None, "omitted_rows": omitted_rows,
+        **({"fields": list(fields)} if fields else {}),
+    }
 
 
 class CaseArgs(Model):
@@ -68,13 +205,16 @@ TOOL_SPECS = {
     ),
     "search_logs": (
         LogArgs,
-        "先查受管组件日志。完整结果已包含当时所有可读日志，无需再按关键词查同期。"
+        "查受管组件日志。limit 控制保存到证据的条数。大型结果只返回最新一页作为预览。"
+        "回看此前的记录时，按证据 ID 用 read_evidence 从 offset=0 分页。"
         "确需查看后续日志时，用上次日志结果的 observed_at 作为 since。",
     ),
     "get_recent_config_changes": (NoArgs, "读取受管应用的配置变更记录和当前配置版本。"),
     "read_evidence": (
         EvidenceArgs,
-        "按证据 ID 回取本次调查的原始观测。原始指标 processing_age_ms 指当前在途耗时，"
+        "按证据 ID 回取本次调查的原始观测。日志默认每页 20 条，按需用 next_offset 续查。"
+        "用 fields 缩小返回字段；省略的超长行位置列在 omitted_rows。"
+        "原始指标 processing_age_ms 指当前在途耗时，"
         "processing_latency_ms 指上次已完成样本耗时。",
     ),
     "retrieve_cases": (CaseArgs, "检索适用于当前应用版本/组件的已验证历史经验；不代表当前根因。"),
@@ -193,7 +333,8 @@ class ToolGateway:
         # 原文回取沿用原证据身份，不生成新的观测时间或 ID，避免把旧结果包装成最新实测。
         if name == "read_evidence":
             try:
-                return {"status": "ok", **self.store.read_evidence(self.run_id, args.evidence_id)}
+                origin = self.store.read_evidence(self.run_id, args.evidence_id)
+                return _evidence_view({"status": "ok", **origin}, args)
             except (KeyError, ValueError) as exc:
                 return {"status": "error", "error": str(exc)}
         # 工作记忆是模型注记而非环境观测，不为更新记忆本身生成能支撑根因的证据。
@@ -269,7 +410,15 @@ class ToolGateway:
             and not data.get("malformed_lines") and not data.get("incomplete_tail")
         ):
             self._complete_log_scan = {"status": "ok", "observed_at": observed_at, **reference}
-        return {**raw, **reference}
+        result = {**raw, **reference}
+        if name == "search_logs" and raw["status"] == "ok":
+            log_key = log_rows_key(data)
+            if log_key and (len(data[log_key]) > _LOG_PAGE_LIMIT or _evidence_size(data) > _EVIDENCE_VIEW_BYTES):
+                preview, page = _log_page(data, log_key)
+                payload = {**result, "data": preview, "view": "log_preview", "page": page}
+                entry = {"id": evidence_id, "tool": name, "raw": raw}
+                return _log_view(payload, entry, log_key, preview, page)
+        return result
 
     def _observe(self, name, args):
         """

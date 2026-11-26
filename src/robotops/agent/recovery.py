@@ -7,8 +7,8 @@ import json
 from collections.abc import Callable
 
 from ..models import DiagnosticReport
-from ..observations import compact_model_observation
-from ..tools import DIRECT_OBSERVATION_TOOLS
+from ..observations import compact_model_observation, log_rows_key
+from ..tools import DIRECT_OBSERVATION_TOOLS, EvidenceView
 
 OPTIONAL_TOOLS = {"update_working_memory", "dispatch_investigation"}
 MAX_STALLED_ROUNDS = 3
@@ -32,7 +32,7 @@ def _observation_signatures(tool: str, data: dict | None) -> set[bytes]:
         return set()
     if tool == "search_logs":
         scope = (data.get("source"), data.get("runtime_id"), data.get("process_name"))
-        records = [(scope, row) for row in data.get("rows") or data.get("lines") or ()]
+        records = [(scope, row) for row in data.get(log_rows_key(data), ())]
     elif tool == "retrieve_cases":
         records = data.get("cases") or ()
     elif tool == "get_recent_config_changes" and "changes" in data:
@@ -72,10 +72,11 @@ class InvestigationRecovery:
         self.failed_tool: str | None = None
         self.stalled_rounds = 0
         self.observations: set[bytes] = set()
+        self.cited_log_rows: set[bytes] = set()
         self.read_evidence = read_evidence
         self.observations.update(self._referenced_signatures(initial_evidence_ids))
 
-    def _referenced_signatures(self, references) -> set[bytes]:
+    def _referenced_signatures(self, references, *, from_findings: bool = False) -> set[bytes]:
         signatures = set()
         for evidence_id in references:
             try:
@@ -83,7 +84,15 @@ class InvestigationRecovery:
             except (OSError, KeyError, ValueError):
                 # A reference without readable content cannot establish new progress.
                 continue
-            signatures.update(_evidence_signatures(entry))
+            observed = _evidence_signatures(entry)
+            if from_findings and entry["tool"] == "search_logs":
+                # A branch finding cites a log without delivering its rows to the receiving agent.
+                new_rows = observed - self.observations - self.cited_log_rows
+                if new_rows:
+                    self.cited_log_rows.update(new_rows)
+                    signatures.add(hashlib.sha256(b"cited log rows:" + min(new_rows)).digest())
+            else:
+                signatures.update(observed)
         return signatures
 
     def record_progress(self, tool: str, result: dict) -> bool:
@@ -91,12 +100,14 @@ class InvestigationRecovery:
         if result.get("status") != "ok":
             return False
         if tool == "dispatch_investigation":
-            signatures = self._referenced_signatures({
+            references = {
                 evidence_id for finding in result.get("findings", [])
                 for key in ("support_ids", "contradict_ids") for evidence_id in finding.get(key, [])
-            })
-        elif tool == "read_evidence":
-            signatures = _evidence_signatures(result)
+            }
+            signatures = self._referenced_signatures(references, from_findings=True)
+        elif isinstance(result, EvidenceView) or tool == "read_evidence":
+            observation = result.observation if isinstance(result, EvidenceView) else result
+            signatures = _evidence_signatures(observation)
         else:
             signatures = _observation_signatures(tool, result.get("data"))
         new = not signatures.issubset(self.observations)

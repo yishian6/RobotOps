@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from ..config import ContextWindow
 from ..observations import compact_model_observation
 from ..storage import Store
-from .client import AssistantMessage, DeepSeekClient, ModelError
+from .client import AssistantMessage, ContextLengthError, DeepSeekClient, ModelError
 from .context import ContextSnapshots, Strategy, assemble, fit_context_window
 from .recovery import MAX_STALLED_ROUNDS, OPTIONAL_TOOLS, InvestigationRecovery
 
@@ -94,6 +94,7 @@ class InvestigationGraph:
             self.store.trace(self.run_id, {
                 "type": "model_error", **tags, "context_sequence": sequence,
                 "usage": exc.usage, "error": str(exc),
+                **({"error_kind": "context_length"} if isinstance(exc, ContextLengthError) else {}),
             })
             raise
 
@@ -163,14 +164,14 @@ class InvestigationGraph:
                 "提交结果，明确标出缺少实测的结论和待查项。",
             }}]
 
-        def call_model(state: InvestigationState) -> InvestigationState:
+        def prepare_request(state, retry_limit):
             nonlocal closing, context_sequence
             _remaining_time(deadline)
             history = state["messages"]
             accepted, budget = self.budget.claim(reserve=1 if is_branch else 0)
-            closing = recovery.failed_tool
+            closing = "context_window" if retry_limit is not None else recovery.failed_tool
             if not accepted:
-                closing = "model_call_budget"
+                closing = "context_window" if retry_limit is not None else "model_call_budget"
             elif closing is None and recovery.stalled_rounds >= MAX_STALLED_ROUNDS:
                 closing = "no_progress"
             elif closing is None and budget["remaining"] == budget["reserved_for_parent_report"]:
@@ -181,13 +182,14 @@ class InvestigationGraph:
             }
             try:
                 if not accepted:
-                    return {"messages": history, "report": fallback_report("model_call_budget")}
+                    return None
                 memory = memory_snapshot()
                 base, manifest = assemble(history, memory, self.context_strategy)
                 assembled = manifest.copy()
                 available = request_tools(closing)
                 outgoing, window_audit = fit_context_window(
                     history, base, available, memory, manifest, self.context_window,
+                    retry_limit=retry_limit,
                 )
                 if not window_audit["fits"] and closing is None:
                     initial = window_audit["before_estimated_tokens"]
@@ -201,7 +203,9 @@ class InvestigationGraph:
                 if not window_audit["fits"]:
                     closing = "context_window"
                     budget_event.update(report_only=closing, context_window=window_audit)
-                    return {"messages": history, "report": fallback_report(closing)}
+                    return None
+                if retry_limit is not None:
+                    window_audit["provider_retry"] = True
                 manifest.update(audit, context_window=window_audit)
                 budget_event["report_only"] = closing
                 if closing is not None:
@@ -210,14 +214,32 @@ class InvestigationGraph:
                 # 先保存实际发送视图，网络错误也能对应到输入。
                 context_sequence = self.snapshots.save(outgoing, available, memory, {**manifest, **tags})
                 budget_event["context_sequence"] = context_sequence
-                if len(history) == len(messages):
+                if len(history) == len(messages) and retry_limit is None:
                     self.store.trace(self.run_id, {
                         "type": "prompt", **tags, **metadata, "context_sequence": context_sequence,
                     })
             finally:
                 self.store.trace(self.run_id, budget_event)
+            return outgoing, available, window_audit["after_estimated_tokens"]
+
+        def call_model(state: InvestigationState) -> InvestigationState:
+            history = state["messages"]
+            request = prepare_request(state, None)
+            if request is None:
+                return {"messages": history, "report": fallback_report(closing)}
+            outgoing, available, estimated = request
             try:
                 message = self._request_message(outgoing, available, tags, context_sequence, deadline)
+            except ContextLengthError:
+                # Refit once with report-only tools and require a strictly smaller input.
+                request = prepare_request(state, estimated - 1)
+                if request is None:
+                    return {"messages": history, "report": fallback_report("context_window")}
+                outgoing, available, _ = request
+                try:
+                    message = self._request_message(outgoing, available, tags, context_sequence, deadline)
+                except ModelError:
+                    return {"messages": history, "report": fallback_report("context_window")}
             except ModelError:
                 if closing is None:
                     raise
